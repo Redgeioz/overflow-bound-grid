@@ -4,6 +4,7 @@ use rand::*;
 use std::hint::black_box;
 
 use lib::ball::*;
+use lib::external::*;
 use lib::rect::*;
 use lib::*;
 
@@ -82,7 +83,6 @@ fn search(c: &mut Criterion) {
     arm!(TwoLayerGrid, GRID_CELL_SIZE);
     arm!(MultiGrid, &MULTI_CELL_SIZES);
     bench_search(c, "MultiGrid/2", tree!(MultiGrid, &MULTI_CELL_SIZES_2));
-    arm!(HierarchicalGrid);
     arm!(ExactOverflowBoundGrid);
     arm!(BoxedLooseGrid);
     arm!(LazyOverflowBoundGrid);
@@ -441,7 +441,6 @@ fn self_query(c: &mut Criterion) {
     arm!(SpanOverflowBoundGrid);
     arm!(HaloOverflowBoundGrid);
     arm!(HierarchicalLooseGrid);
-    arm!(HierarchicalGrid);
     arm!(UniformGrid, GRID_CELL_SIZE);
     arm!(TwoLayerGrid, GRID_CELL_SIZE);
     arm!(SpanGrid, GRID_CELL_SIZE);
@@ -503,7 +502,6 @@ fn pairs(c: &mut Criterion) {
     arm!("MultiGrid/2", tree!(MultiGrid, &MULTI_CELL_SIZES_2));
     arm!("HierarchicalLooseGrid", tree!(HierarchicalLooseGrid));
     arm!("BoxedLooseGrid", tree!(BoxedLooseGrid));
-    arm!("HierarchicalGrid", tree!(HierarchicalGrid));
     arm!("UniformGrid", tree!(UniformGrid, GRID_CELL_SIZE));
     arm!("TwoLayerGrid", tree!(TwoLayerGrid, GRID_CELL_SIZE));
     arm!("SpanGrid", tree!(SpanGrid, GRID_CELL_SIZE));
@@ -543,6 +541,38 @@ fn pairs_160k(c: &mut Criterion) {
     group.finish();
 }
 
+/// [`search`] in the scene of `pairs_160k`, every ball searching with its own
+/// bounds, for the structures compared there except the sweep, which is not
+/// a spatial index.
+fn search_160k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("search_160k");
+    group.sample_size(10);
+    let bounds = ball_bounds_in(&LARGE_BOUNDS, LARGE_AMOUNT, 5);
+    macro_rules! arm {
+        ($name:expr, $tree:expr) => {{
+            let mut tree = $tree;
+            for (id, item) in bounds.iter().enumerate() {
+                tree.insert_item(item.clone(), id);
+            }
+            tree.end_frame();
+            group.bench_function($name, |b| {
+                b.iter(|| {
+                    bounds.iter().for_each(|query| {
+                        tree.search_items(query, |id| {
+                            black_box(id);
+                        });
+                    });
+                });
+            });
+        }};
+    }
+    arm!("HierarchicalLooseGrid", HierarchicalLooseGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
+    arm!("HaloOverflowBoundGrid", HaloOverflowBoundGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
+    arm!("UniformGrid", UniformGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
+    arm!("TwoLayerGrid", TwoLayerGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
+    group.finish();
+}
+
 /// The pairs of the small balls, which all fit a cell, in the single-level
 /// grids with cells of 156.25 units; `MultiGrid` with one collection is a
 /// single-level loose grid without bounds.
@@ -575,5 +605,6 @@ criterion_group!(
     pairs,
     small_pairs,
     pairs_160k,
+    search_160k,
 );
 criterion_main!(bench);

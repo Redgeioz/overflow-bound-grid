@@ -10,6 +10,18 @@ path = "src/lib.rs"
 [dependencies]
 grid = "0.11"
 rand = "0.8"
+# Without the default `spade` (triangulation), which the BVH does not use.
+parry2d-f64 = { version = "=0.31.1", optional = true, default-features = false, features = ["required-features", "std"] }
+# Packed (static) R-trees, rebuilt every frame.
+static_aabb2d_index = { version = "=2.1.0", optional = true, features = ["unsafe_optimizations"] }
+geo-index = { version = "=0.4.0", optional = true, default-features = false }
+
+[features]
+default = ["parry", "packed"]
+# The adapter of parry2d-f64's BVH in `src/external`, for comparisons.
+parry = ["dep:parry2d-f64"]
+# The adapters of the packed R-trees of static_aabb2d_index and geo-index.
+packed = ["dep:static_aabb2d_index", "dep:geo-index"]
 
 [dev-dependencies]
 criterion = "0.5"
@@ -20,6 +32,10 @@ harness = false
 
 [[bench]]
 name = "update"
+harness = false
+
+[[bench]]
+name = "frame"
 harness = false
 
 [workspace]

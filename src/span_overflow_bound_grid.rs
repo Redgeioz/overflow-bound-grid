@@ -4,6 +4,7 @@ use crate::layer_geometry::{
     LayerGeometry, Levels, build_levels, half_node_corners, scan_range, size_level,
 };
 use crate::exact_overflow_bound_grid::DirectionalOverflow;
+use crate::node_marks::{BoxedNode, NodeMarks};
 use crate::overflow_bound::{cell_overflow, higher, lower};
 use crate::rect::{EMPTY, NOWHERE, Rectangle};
 use grid::*;
@@ -157,15 +158,29 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         }
     }
 
-    /// On every touched level, shrink the box of every node and the span of
-    /// every column and row to the items held now, undoing the growth from
-    /// items that have since moved, shrunk or left. Visits every node of a
-    /// touched level once, and the items of its touched rows; untouched
-    /// levels are already exact and are skipped.
+    /// On every touched level, shrink the boxes of the nodes that items were
+    /// stored in, replaced in or taken from, and the spans of their columns
+    /// and rows, to the items held now, undoing the growth from items that
+    /// have since moved, shrunk or left; untouched levels are already exact
+    /// and are skipped. A refreshed box is the union of its items, so the
+    /// spans follow from the boxes, one per node rather than one per item.
+    /// Either way of refreshing a level below leaves the boxes and spans
+    /// computed from the items (a span end at zero may keep either sign,
+    /// which no comparison tells apart).
     ///
-    /// A refreshed box is the union of its items, so the spans follow from
-    /// the boxes, one per node rather than one per item.
+    /// Where at most half the nodes of a level are marked, only the marked
+    /// nodes are visited, after reading every mark, and a column or row span
+    /// is rebuilt only if a marked node held one of its ends and no longer
+    /// reaches it, or a node in it emptied. Otherwise every node of the level
+    /// is visited once, with the items of its touched rows.
     pub fn refresh_bounds(&mut self) {
+        self.refresh_with(NodeMarks::is_sparse);
+    }
+
+    /// [`refresh_bounds`](Self::refresh_bounds), visiting only the marked
+    /// nodes of a level where `sparse(marked, occupied, all nodes)` holds and sweeping
+    /// it row by row elsewhere.
+    fn refresh_with(&mut self, sparse: impl Fn(usize, usize, usize) -> bool) {
         for level in 1..=MAX_LEVEL as usize {
             let geometry = &self.geometry[level];
             let lines = &mut self.lines[level];
@@ -176,9 +191,22 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
             if geometry.is_empty() {
                 lines.clear();
                 lines.row_touched.fill(false);
+                lines.marks.clear();
                 continue;
             }
             let grid = &mut self.layers[level];
+            if sparse(lines.marks.count(), lines.marks.occupied(), grid.cols() * grid.rows()) {
+                let LineSpan {
+                    columns,
+                    rows,
+                    row_touched,
+                    marks,
+                    ..
+                } = lines;
+                marks.refresh(grid, columns, rows, |_, _| {});
+                row_touched.fill(false);
+                continue;
+            }
             // A column span crosses every row, so it is rebuilt from the
             // boxes of all rows; the boxes and span of a row are rebuilt only
             // if the row is touched.
@@ -200,6 +228,7 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
                     }
                 }
             }
+            lines.marks.clear();
         }
     }
 
@@ -258,6 +287,7 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         let coord @ (level, x, y) = self.position(&bounds);
         self.grow_lines(&bounds, coord);
         let node = &mut self.layers[level][y][x];
+        let filled = node.items.is_empty();
         node.grow(&bounds);
         let handle = self
             .slots
@@ -267,6 +297,9 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
             item,
             handle,
         });
+        if filled {
+            self.lines[level].marks.filled();
+        }
         self.occupy(level);
         handle
     }
@@ -280,7 +313,9 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         let entry = self.take_entry(level, x, y, location.index as usize);
         debug_assert_eq!(entry.handle, handle);
         self.slots.free(handle);
-        self.lines[level].mark_taken(y);
+        // SAFETY: `take_entry` indexed node `(x, y)` of this level's grid,
+        // whose columns and rows the spans match.
+        unsafe { self.lines[level].mark_taken((x, y)) };
         self.vacate(level);
     }
 
@@ -307,11 +342,16 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         let entry = self.take_entry(level, x, y, i);
         self.grow_lines(&bounds, curt_coord);
         let new_node = &mut self.layers[nl][ny][nx];
+        let filled = new_node.items.is_empty();
         new_node.grow(&bounds);
         *self.slots.get_mut(handle) = GridLocation::new(curt_coord, new_node.items.len());
         new_node.items.push(Entry { bounds, ..entry });
+        if filled {
+            self.lines[nl].marks.filled();
+        }
         // `grow_lines` marked the new level; mark the old one, which lost an item.
-        self.lines[level].mark_taken(y);
+        // SAFETY: `take_entry` indexed node `(x, y)` of this level's grid.
+        unsafe { self.lines[level].mark_taken((x, y)) };
         self.occupy(nl);
         self.vacate(level);
     }
@@ -356,8 +396,13 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
             self.slots.get_mut(moved.handle).index = index as u32;
         }
         if node.items.is_empty() {
-            // With nothing left to cover, search skips the node at once.
+            // With nothing left to cover, search skips the node at once. The
+            // refresh can then no longer tell whether the box held an end of
+            // its column's or row's span, so both are rebuilt.
             node.bounds = EMPTY;
+            // SAFETY: node `(x, y)` of this level was just indexed with
+            // bounds checks, and the marks match the level's grid.
+            unsafe { self.lines[level].marks.emptied((x, y)) };
         }
         entry
     }
@@ -382,35 +427,23 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
             && self.world_bounds.contains_point(center)
     }
 
-    /// Search with the bounds of every stored item, as [`search`](Self::search)
-    /// would item by item, and call `callback` with the item searched for and
-    /// each item found, the searched one included. The items are taken cell
-    /// by cell, depth first through the levels and in Morton order within
-    /// each, so that consecutive searches read nearby cells and the same
-    /// ancestors. The walk stops at the finest level that holds items but
-    /// visits every cell down to it, so where cells far outnumber items,
-    /// searching item by item is faster. On the search bench's distribution,
-    /// the `self_query` bench group measured it 8% faster than searching
-    /// item by item in random order with 10,000 items, and a one-off probe
-    /// outside the repository 27% with 640,000 items at the same
-    /// density, where the random order misses the cache.
-    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
-        let layers = &self.layers;
-        // Levels finer than the finest one holding items need no visit.
-        let Some(finest) =
-            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
-        else {
-            return;
-        };
-        for_each_cell_hierarchically(
-            finest,
-            |level| (layers[level].cols(), layers[level].rows()),
-            |level, x, y| {
-                for entry in &layers[level][y][x].items {
-                    self.search(&entry.bounds, |found| callback(entry.item, found));
-                }
-            },
-        );
+    /// Call `callback` with every stored item and each stored item whose bounds
+    /// intersect its own, the item itself included where its bounds meet
+    /// themselves: what searching with the bounds of every item reports. The
+    /// results come from the walk of [`for_each_pair`](Self::for_each_pair),
+    /// each pair in both orders, so a result across levels is found by the
+    /// coarser item's scan of the finer levels and no item walks up to the
+    /// coarser ones; the results of one query are not reported together. A pair
+    /// that rounding hides from that scan (see
+    /// [`for_each_pair`](Self::for_each_pair)) is missing in both orders, where
+    /// searching item by item misses it only from the other side. The walk
+    /// visits every cell down to the finest level that holds items, so where
+    /// cells far outnumber items, searching item by item is faster. On the
+    /// search bench's distribution, the `self_query` bench group measured 0.33
+    /// ms, against 1.10 ms for the previous implementation, which searched with
+    /// the bounds of every item in turn, cell by cell.
+    pub fn for_each_self_query(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<true>(callback);
     }
 
     /// Call `callback` once for every pair of distinct stored items whose
@@ -421,14 +454,31 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
     /// them; items in the root pair up with the root items after them. Below
     /// its level an item scans the finer levels as a search does, so a pair
     /// across levels is found once, by the item on the coarser level, and no
-    /// item looks above its own level. The nodes are visited as in
-    /// [`for_each_self_query`](Self::for_each_self_query).
+    /// item looks above its own level. The nodes are visited depth first
+    /// through the levels and in Morton order within each, so that
+    /// consecutive items read nearby cells, down to the finest level that
+    /// holds items.
+    ///
+    /// Like the scan of a search, which it copies, the scan of the finer levels
+    /// misses an item that rounding takes a float past the half node that its
+    /// level's items reach, as when its width rounds to the node size and its
+    /// center to a node edge; such a pair is not reported.
     ///
     /// Leaving each cross-level pair to its finer item instead, which walked
     /// the ancestor path as a search does, took 0.81 ms against 0.34 ms on the
     /// mixed distribution: nearly all items lie on the finest level, and each
     /// of them paid for a walk over the occupied levels above it.
-    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+    pub fn for_each_pair(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<false>(callback);
+    }
+
+    /// The walk of [`for_each_pair`](Self::for_each_pair) and, with
+    /// `SELF_QUERY`, of [`for_each_self_query`](Self::for_each_self_query),
+    /// which reports each pair in both orders and each item with itself where
+    /// its bounds meet themselves. Inlined into both, so that each compiles
+    /// to a walk of its own.
+    #[inline(always)]
+    fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let layers = &self.layers;
         // Levels finer than the finest one holding items need no visit.
         let Some(finest) =
@@ -441,7 +491,15 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
             |level| (layers[level].cols(), layers[level].rows()),
             |level, x, y| {
                 for (index, entry) in layers[level][y][x].items.iter().enumerate() {
-                    let mut report = |found| callback(entry.item, found);
+                    if SELF_QUERY && entry.bounds.intersects(&entry.bounds) {
+                        callback(entry.item, entry.item);
+                    }
+                    let mut report = |found| {
+                        callback(entry.item, found);
+                        if SELF_QUERY {
+                            callback(found, entry.item);
+                        }
+                    };
                     if level == 1 {
                         self.get_root().pair_with_after(index, &entry.bounds, &mut report);
                     } else {
@@ -806,10 +864,12 @@ struct LineSpan {
     /// Kept here rather than in a separate array because every store already
     /// reaches this struct through `grow`.
     touched: bool,
-    /// The same per row: the refresh shrinks the boxes and rebuilds the span
-    /// of each touched row, and reads only the boxes of the other rows, for
-    /// the column spans.
+    /// The same per row: a refresh that sweeps the level shrinks the boxes
+    /// and rebuilds the span of each touched row, and reads only the boxes
+    /// of the other rows, for the column spans.
     row_touched: Box<[bool]>,
+    /// The same per node, for a refresh that visits only those.
+    marks: NodeMarks,
 }
 
 impl LineSpan {
@@ -819,23 +879,34 @@ impl LineSpan {
             rows: vec![NOWHERE; rows].into_boxed_slice(),
             touched: false,
             row_touched: vec![false; rows].into_boxed_slice(),
+            marks: NodeMarks::new(cols, rows),
         }
     }
 
     /// Widen column `x` and row `y` to cover `bounds` stored there, and mark
-    /// the level and the row touched.
+    /// the level, the row and the node touched.
     #[inline]
     fn grow(&mut self, (x, y): (usize, usize), bounds: &Rectangle) {
-        self.touched = true;
-        self.row_touched[y] = true;
         self.widen((x, y), bounds);
+        // SAFETY: `widen` indexed column `x` and row `y` with bounds checks.
+        unsafe { self.mark_taken((x, y)) };
     }
 
-    /// Mark the level and row `y` touched after an item is taken from it.
+    /// Mark the level, row `y` and node `(x, y)` touched, without bounds
+    /// checks, as every store and take runs this.
+    ///
+    /// # Safety
+    ///
+    /// `x` and `y` must be a column and a row of the level.
     #[inline]
-    fn mark_taken(&mut self, y: usize) {
+    unsafe fn mark_taken(&mut self, (x, y): (usize, usize)) {
+        debug_assert!(y < self.row_touched.len());
         self.touched = true;
-        self.row_touched[y] = true;
+        // SAFETY: by the caller's guarantee.
+        unsafe {
+            *self.row_touched.get_unchecked_mut(y) = true;
+            self.marks.mark((x, y));
+        }
     }
 
     /// Widen column `x` and row `y` to cover `bounds` without marking
@@ -935,6 +1006,18 @@ impl<T: Copy> SpanOverflowBoundGridNode<T> {
     }
 }
 
+impl<T: Copy> BoxedNode for SpanOverflowBoundGridNode<T> {
+    #[inline]
+    fn bounds(&self) -> &Rectangle {
+        &self.bounds
+    }
+
+    #[inline]
+    fn refresh(&mut self) {
+        SpanOverflowBoundGridNode::refresh(self);
+    }
+}
+
 /// Grow `target` to cover `bounds`. A NaN coordinate leaves its side
 /// unchanged, which is harmless because an item with one intersects no query.
 #[inline]
@@ -960,6 +1043,14 @@ mod tests {
     ];
 
     crate::grid_tests::span_tests!(SpanOverflowBoundGridNode);
+
+    /// For the shared refresh tests: whether `level` holds no level mark.
+    fn level_marks_clear(tree: &Tree, level: usize) -> bool {
+        !tree.lines[level].touched
+    }
+
+    /// For the shared refresh tests: nothing beyond the boxes and spans.
+    fn assert_refreshed_extra(_tree: &Tree, _level: usize, _context: &str) {}
 
     /// Storing an item on a level, replacing one there or taking one from it
     /// marks the level; a refresh clears every mark, and an unchanged level

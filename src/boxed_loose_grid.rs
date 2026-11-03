@@ -274,31 +274,23 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
             && self.world_bounds.contains_point(center)
     }
 
-    /// Search with the bounds of every stored item, as [`search`](Self::search)
-    /// would item by item, and call `callback` with the item searched for and
-    /// each item found, the searched one included. The items are taken cell
-    /// by cell, depth first through the levels and in Morton order within
-    /// each, so that consecutive searches read nearby cells and the same
-    /// ancestors. The walk stops at the finest level that holds items but
-    /// visits every cell down to it, so where cells far outnumber items,
-    /// searching item by item is faster.
-    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
-        let layers = &self.layers;
-        // Levels finer than the finest one holding items need no visit.
-        let Some(finest) =
-            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
-        else {
-            return;
-        };
-        for_each_cell_hierarchically(
-            finest,
-            |level| (layers[level].cols(), layers[level].rows()),
-            |level, x, y| {
-                for entry in &layers[level][y][x].items {
-                    self.search(&entry.bounds, |found| callback(entry.item, found));
-                }
-            },
-        );
+    /// Call `callback` with every stored item and each stored item whose bounds
+    /// intersect its own, the item itself included where its bounds meet
+    /// themselves: what searching with the bounds of every item reports. The
+    /// results come from the walk of [`for_each_pair`](Self::for_each_pair),
+    /// each pair in both orders, so a result across levels is found by the
+    /// coarser item's scan of the finer levels and no item walks up to the
+    /// coarser ones; the results of one query are not reported together. A pair
+    /// that rounding hides from that scan (see
+    /// [`for_each_pair`](Self::for_each_pair)) is missing in both orders, where
+    /// searching item by item misses it only from the other side. The walk
+    /// visits every cell down to the finest level that holds items, so where
+    /// cells far outnumber items, searching item by item is faster. On the
+    /// search bench's distribution, the `self_query` bench group measured 0.38
+    /// ms, against 1.31 ms for the previous implementation, which searched with
+    /// the bounds of every item in turn, cell by cell.
+    pub fn for_each_self_query(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<true>(callback);
     }
 
     /// Call `callback` once for every pair of distinct stored items whose
@@ -309,14 +301,31 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
     /// them; items in the root pair up with the root items after them. Below
     /// its level an item scans the finer levels as a search does, so a pair
     /// across levels is found once, by the item on the coarser level, and no
-    /// item looks above its own level. The nodes are visited as in
-    /// [`for_each_self_query`](Self::for_each_self_query).
+    /// item looks above its own level. The nodes are visited depth first
+    /// through the levels and in Morton order within each, so that
+    /// consecutive items read nearby cells, down to the finest level that
+    /// holds items.
+    ///
+    /// Like the scan of a search, which it copies, the scan of the finer levels
+    /// misses an item that rounding takes a float past the half node that its
+    /// level's items reach, as when its width rounds to the node size and its
+    /// center to a node edge; such a pair is not reported.
     ///
     /// Leaving each cross-level pair to its finer item instead, which walked
     /// the ancestor path as a search does, took 1.05 ms against 0.39 ms on the
     /// mixed distribution: nearly all items lie on the finest level, and each
     /// of them paid for a walk over the occupied levels above it.
-    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+    pub fn for_each_pair(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<false>(callback);
+    }
+
+    /// The walk of [`for_each_pair`](Self::for_each_pair) and, with
+    /// `SELF_QUERY`, of [`for_each_self_query`](Self::for_each_self_query),
+    /// which reports each pair in both orders and each item with itself where
+    /// its bounds meet themselves. Inlined into both, so that each compiles
+    /// to a walk of its own.
+    #[inline(always)]
+    fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let layers = &self.layers;
         // Levels finer than the finest one holding items need no visit.
         let Some(finest) =
@@ -329,7 +338,15 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
             |level| (layers[level].cols(), layers[level].rows()),
             |level, x, y| {
                 for (index, entry) in layers[level][y][x].items.iter().enumerate() {
-                    let mut report = |found| callback(entry.item, found);
+                    if SELF_QUERY && entry.bounds.intersects(&entry.bounds) {
+                        callback(entry.item, entry.item);
+                    }
+                    let mut report = |found| {
+                        callback(entry.item, found);
+                        if SELF_QUERY {
+                            callback(found, entry.item);
+                        }
+                    };
                     if level == 1 {
                         self.get_root().pair_with_after(index, &entry.bounds, &mut report);
                     } else {

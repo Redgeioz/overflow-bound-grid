@@ -5,14 +5,12 @@ use criterion::{
 use rand::*;
 
 use lib::ball::*;
+use lib::external::*;
 use lib::rect::*;
 use lib::*;
 
 mod common;
 use common::*;
-
-const MIN_VELOCITY: f64 = 1.0;
-const MAX_VELOCITY: f64 = 5.0;
 
 /// `count` moving balls at random points, with radii drawn from
 /// `MIN_RADIUS..MAX_RADIUS` that double at most `doublings` times, each time
@@ -125,7 +123,6 @@ macro_rules! bench_all {
             UniformGrid(GRID_CELL_SIZE),
             TwoLayerGrid(GRID_CELL_SIZE),
             MultiGrid(&MULTI_CELL_SIZES),
-            HierarchicalGrid,
         ])
     };
     ($c:expr, $name:literal, $bench:ident, [$($t:ident $(($cell:expr))?),* $(,)?]) => {{

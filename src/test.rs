@@ -1,4 +1,4 @@
-use crate::{ball::*, rect::*, *};
+use crate::{ball::*, external::*, rect::*, *};
 
 use rand::prelude::*;
 use std::collections::HashSet;
@@ -64,7 +64,6 @@ struct Trees {
     uniform: UniformGrid<usize>,
     two_layer: TwoLayerGrid<usize>,
     multi: MultiGrid<usize>,
-    hierarchical: HierarchicalGrid<usize, MAX_LEVEL>,
     overflow_bound: ExactOverflowBoundGrid<usize, MAX_LEVEL>,
     boxed_loose: BoxedLooseGrid<usize, MAX_LEVEL>,
     lazy: LazyOverflowBoundGrid<usize, MAX_LEVEL>,
@@ -81,7 +80,6 @@ struct Handles {
     uniform: ItemHandle,
     two_layer: ItemHandle,
     multi: ItemHandle,
-    hierarchical: ItemHandle,
     overflow_bound: ItemHandle,
     boxed_loose: ItemHandle,
     lazy: ItemHandle,
@@ -98,7 +96,6 @@ impl Trees {
             uniform: UniformGrid::new(world.clone(), UNIFORM_CELL_SIZE),
             two_layer: TwoLayerGrid::new(world.clone(), UNIFORM_CELL_SIZE),
             multi: MultiGrid::new(world.clone(), &MULTI_CELL_SIZES),
-            hierarchical: HierarchicalGrid::new(world.clone()),
             overflow_bound: ExactOverflowBoundGrid::new(world.clone()),
             boxed_loose: BoxedLooseGrid::new(world.clone()),
             lazy: LazyOverflowBoundGrid::new(world.clone()),
@@ -115,7 +112,6 @@ impl Trees {
             uniform: self.uniform.insert(bounds.clone(), id),
             two_layer: self.two_layer.insert(bounds.clone(), id),
             multi: self.multi.insert(bounds.clone(), id),
-            hierarchical: self.hierarchical.insert(bounds.clone(), id),
             overflow_bound: self.overflow_bound.insert(bounds.clone(), id),
             boxed_loose: self.boxed_loose.insert(bounds.clone(), id),
             lazy: self.lazy.insert(bounds.clone(), id),
@@ -131,7 +127,6 @@ impl Trees {
         self.uniform.update(bounds.clone(), handles.uniform);
         self.two_layer.update(bounds.clone(), handles.two_layer);
         self.multi.update(bounds.clone(), handles.multi);
-        self.hierarchical.update(bounds.clone(), handles.hierarchical);
         self.overflow_bound
             .update(bounds.clone(), handles.overflow_bound);
         self.boxed_loose.update(bounds.clone(), handles.boxed_loose);
@@ -149,7 +144,6 @@ impl Trees {
         self.uniform.remove(handles.uniform);
         self.two_layer.remove(handles.two_layer);
         self.multi.remove(handles.multi);
-        self.hierarchical.remove(handles.hierarchical);
         self.overflow_bound.remove(handles.overflow_bound);
         self.boxed_loose.remove(handles.boxed_loose);
         self.lazy.remove(handles.lazy);
@@ -189,10 +183,6 @@ impl Trees {
             (
                 "MultiGrid",
                 collect(id, |cb| self.multi.search(bounds, cb)),
-            ),
-            (
-                "HierarchicalGrid",
-                collect(id, |cb| self.hierarchical.search(bounds, cb)),
             ),
             (
                 "ExactOverflowBoundGrid",
@@ -416,7 +406,6 @@ fn structures_are_send_and_sync() {
     assert_send_sync::<UniformGrid<usize>>();
     assert_send_sync::<TwoLayerGrid<usize>>();
     assert_send_sync::<MultiGrid<usize>>();
-    assert_send_sync::<HierarchicalGrid<usize, MAX_LEVEL>>();
     assert_send_sync::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>();
     assert_send_sync::<BoxedLooseGrid<usize, MAX_LEVEL>>();
     assert_send_sync::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>();
@@ -425,6 +414,15 @@ fn structures_are_send_and_sync() {
     assert_send_sync::<SpanGrid<usize>>();
     assert_send_sync::<HaloGrid<usize>>();
     assert_send_sync::<SortAndSweep<usize>>();
+    assert_send_sync::<SpatialJoinSweep<usize>>();
+    #[cfg(feature = "parry")]
+    assert_send_sync::<external::ParryBvh<usize>>();
+    // Its search stack lives in a cell.
+    #[cfg(feature = "packed")]
+    {
+        fn assert_send<S: Send>() {}
+        assert_send::<external::PackedRTree<usize>>();
+    }
 }
 
 /// A `MAX_LEVEL` of zero, or one whose finest level has more cells than
@@ -444,8 +442,6 @@ rejects_max_level!(
     loose_quadtree_rejects_level_65: LooseQuadTree::<usize, 65, MAX_ITEMS>::new(world()), "too large";
     hierarchical_loose_grid_rejects_level_zero: HierarchicalLooseGrid::<usize, 0>::new(world()), "cannot be zero";
     hierarchical_loose_grid_rejects_level_65: HierarchicalLooseGrid::<usize, 65>::new(world()), "too large";
-    hierarchical_grid_rejects_level_zero: HierarchicalGrid::<usize, 0>::new(world()), "cannot be zero";
-    hierarchical_grid_rejects_level_65: HierarchicalGrid::<usize, 65>::new(world()), "too large";
     exact_grid_rejects_level_zero: ExactOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
     exact_grid_rejects_level_65: ExactOverflowBoundGrid::<usize, 65>::new(world()), "too large";
     boxed_loose_grid_rejects_level_zero: BoxedLooseGrid::<usize, 0>::new(world()), "cannot be zero";
@@ -728,11 +724,10 @@ fn check_tight_overflow_bounds() {
     // a cell edge by a single float test that reasoning.
     check_tight_bounds::<TwoLayerGrid<usize>>("TwoLayerGrid");
     check_tight_bounds::<MultiGrid<usize>>("MultiGrid");
-    // Without bounds the ancestor walk and HG's scans decide from the query's
-    // corners which neighbors to read; items reaching across an edge by a
-    // single float test those decisions.
+    // Without bounds the ancestor walk decides from the query's corners which
+    // neighbors to read; items reaching across an edge by a single float test
+    // those decisions.
     check_tight_bounds::<HierarchicalLooseGrid<usize, MAX_LEVEL>>("HierarchicalLooseGrid");
-    check_tight_bounds::<HierarchicalGrid<usize, MAX_LEVEL>>("HierarchicalGrid");
 }
 
 /// Bounds of an item on a random level, the root included.
@@ -1113,13 +1108,6 @@ impl OverflowBounded for SpanGrid<usize> {
     forward_items!(refresh_bounds);
 }
 
-impl<const L: u8> OverflowBounded for HierarchicalGrid<usize, L> {
-    fn create(world: Rectangle, _fit: bool) -> Self {
-        Self::new(world)
-    }
-    forward_items!();
-}
-
 new_or_fit!(HierarchicalLooseGrid);
 
 /// Structures that search with the bounds of every stored item in one pass.
@@ -1143,7 +1131,6 @@ self_query!(
     SpanOverflowBoundGrid<usize, MAX_LEVEL>,
     HaloOverflowBoundGrid<usize, MAX_LEVEL>,
     HierarchicalLooseGrid<usize, MAX_LEVEL>,
-    HierarchicalGrid<usize, MAX_LEVEL>,
     UniformGrid<usize>,
     TwoLayerGrid<usize>,
     MultiGrid<usize>,
@@ -1196,9 +1183,13 @@ const SELF_QUERY_WORLDS: [Rectangle; 4] = [
 ];
 
 /// Items of the kinds `tight_item` never makes: zero-sized, larger than the
-/// root, and outside the world beyond its min corner.
+/// root, outside the world beyond its min corner, and half a finest cell
+/// large but centered just beyond the world's max corner, so that it fits
+/// a cell yet goes to the root or the overflow node, and reaches into the
+/// world's last cells.
 fn odd_items(rng: &mut StdRng, root: &Rectangle, world: &Rectangle) -> Vec<Rectangle> {
     let (x, y) = world.get_random_point(rng);
+    let cell = finest_cell_size(world);
     vec![
         Rectangle::new(x, y, x, y),
         root.scale(1.5),
@@ -1208,50 +1199,12 @@ fn odd_items(rng: &mut StdRng, root: &Rectangle, world: &Rectangle) -> Vec<Recta
             world.min_x - 0.1 * world.get_width(),
             world.min_y - 0.05 * world.get_height(),
         ),
+        Rectangle::center_rect(world.max_x + 0.1 * cell, world.max_y + 0.1 * cell, 0.5 * cell, 0.5 * cell),
     ]
 }
 
 fn check_self_query<Tree: OverflowBounded + SelfQuery>(name: &str) {
-    let mut rng = StdRng::seed_from_u64(13);
-    for (world, fit) in SELF_QUERY_WORLDS.into_iter().flat_map(|world| [(world.clone(), false), (world, true)]) {
-        let context = format!("{name}, world {world:?}, fit {fit}");
-        let mut tree = Tree::create(world.clone(), fit);
-        let root = tree.root();
-        let mut items: Vec<Option<(ItemHandle, Rectangle)>> = (0..300)
-            .map(|id| {
-                let bounds = tight_item(&mut rng, &root, &world, 0.1);
-                Some((tree.insert_item(bounds.clone(), id), bounds))
-            })
-            .collect();
-        for bounds in odd_items(&mut rng, &root, &world) {
-            let handle = tree.insert_item(bounds.clone(), items.len());
-            items.push(Some((handle, bounds)));
-        }
-        assert_self_query_matches_brute_force(&tree, &items, &context);
-        for round in 0..3 {
-            for (handle, bounds) in items.iter_mut().flatten() {
-                if rng.gen_bool(0.5) {
-                    *bounds = tight_item(&mut rng, &root, &world, 0.1);
-                    tree.update_item(bounds.clone(), *handle);
-                }
-            }
-            for _ in 0..30 {
-                let id = rng.gen_range(0..items.len());
-                if let Some((handle, _)) = items[id].take() {
-                    tree.remove_item(handle);
-                }
-            }
-            for _ in 0..20 {
-                let bounds = tight_item(&mut rng, &root, &world, 0.1);
-                let handle = tree.insert_item(bounds.clone(), items.len());
-                items.push(Some((handle, bounds)));
-            }
-            let context = format!("{context}, round {round}");
-            assert_self_query_matches_brute_force(&tree, &items, &format!("{context}, stale"));
-            tree.refresh();
-            assert_self_query_matches_brute_force(&tree, &items, &format!("{context}, refreshed"));
-        }
-    }
+    check_scenario::<Tree>(name, 13, assert_self_query_matches_brute_force);
 }
 
 /// Structures that report every intersecting pair of distinct items once.
@@ -1276,7 +1229,6 @@ pair_query!(
     MultiGrid<usize>,
     HierarchicalLooseGrid<usize, MAX_LEVEL>,
     BoxedLooseGrid<usize, MAX_LEVEL>,
-    HierarchicalGrid<usize, MAX_LEVEL>,
     UniformGrid<usize>,
     TwoLayerGrid<usize>,
     SpanGrid<usize>,
@@ -1367,10 +1319,20 @@ fn assert_pairs_match_brute_force(
     assert_eq!(reported, expected, "{context}");
 }
 
-/// As `check_self_query`, for the pairs: random tight items, odd items, then
-/// rounds of updates, removals and insertions, checked stale and refreshed.
 fn check_pairs<Tree: OverflowBounded + PairQuery>(name: &str) {
-    let mut rng = StdRng::seed_from_u64(17);
+    check_scenario::<Tree>(name, 17, assert_pairs_match_brute_force);
+}
+
+/// Run `check` on a tree of every world of `SELF_QUERY_WORLDS`, unfitted and
+/// fitted: on random tight items and the odd items, after each of three
+/// rounds of updates, removals and insertions, stale and refreshed, and on
+/// items packed densely into 8 by 8 cells, before and after moving them.
+fn check_scenario<Tree: OverflowBounded>(
+    name: &str,
+    seed: u64,
+    check: impl Fn(&Tree, &[Option<(ItemHandle, Rectangle)>], &str),
+) {
+    let mut rng = StdRng::seed_from_u64(seed);
     for (world, fit) in SELF_QUERY_WORLDS.into_iter().flat_map(|world| [(world.clone(), false), (world, true)]) {
         let context = format!("{name}, world {world:?}, fit {fit}");
         let mut tree = Tree::create(world.clone(), fit);
@@ -1385,7 +1347,7 @@ fn check_pairs<Tree: OverflowBounded + PairQuery>(name: &str) {
             let handle = tree.insert_item(bounds.clone(), items.len());
             items.push(Some((handle, bounds)));
         }
-        assert_pairs_match_brute_force(&tree, &items, &context);
+        check(&tree, &items, &context);
         for round in 0..3 {
             for (handle, bounds) in items.iter_mut().flatten() {
                 if rng.gen_bool(0.5) {
@@ -1405,9 +1367,9 @@ fn check_pairs<Tree: OverflowBounded + PairQuery>(name: &str) {
                 items.push(Some((handle, bounds)));
             }
             let context = format!("{context}, round {round}");
-            assert_pairs_match_brute_force(&tree, &items, &format!("{context}, stale"));
+            check(&tree, &items, &format!("{context}, stale"));
             tree.refresh();
-            assert_pairs_match_brute_force(&tree, &items, &format!("{context}, refreshed"));
+            check(&tree, &items, &format!("{context}, refreshed"));
         }
 
         // Items a fraction of a finest cell large, packed into 8 by 8 cells, so
@@ -1426,9 +1388,9 @@ fn check_pairs<Tree: OverflowBounded + PairQuery>(name: &str) {
             items.push(Some((handle, bounds)));
         }
         let context = format!("{context}, dense");
-        assert_pairs_match_brute_force(&tree, &items, &format!("{context}, stale"));
+        check(&tree, &items, &format!("{context}, stale"));
         tree.refresh();
-        assert_pairs_match_brute_force(&tree, &items, &format!("{context}, refreshed"));
+        check(&tree, &items, &format!("{context}, refreshed"));
         for (handle, bounds) in items.iter_mut().flatten() {
             if rng.gen_bool(0.5) {
                 let (x, y) = bounds.get_center();
@@ -1442,9 +1404,9 @@ fn check_pairs<Tree: OverflowBounded + PairQuery>(name: &str) {
                 tree.update_item(bounds.clone(), *handle);
             }
         }
-        assert_pairs_match_brute_force(&tree, &items, &format!("{context}, moved, stale"));
+        check(&tree, &items, &format!("{context}, moved, stale"));
         tree.refresh();
-        assert_pairs_match_brute_force(&tree, &items, &format!("{context}, moved, refreshed"));
+        check(&tree, &items, &format!("{context}, moved, refreshed"));
     }
 }
 
@@ -1457,7 +1419,6 @@ fn pairs_match_brute_force() {
     check_pairs::<MultiGrid<usize>>("MultiGrid");
     check_pairs::<HierarchicalLooseGrid<usize, MAX_LEVEL>>("HierarchicalLooseGrid");
     check_pairs::<BoxedLooseGrid<usize, MAX_LEVEL>>("BoxedLooseGrid");
-    check_pairs::<HierarchicalGrid<usize, MAX_LEVEL>>("HierarchicalGrid");
     check_pairs::<UniformGrid<usize>>("UniformGrid");
     check_pairs::<TwoLayerGrid<usize>>("TwoLayerGrid");
     check_pairs::<SpanGrid<usize>>("SpanGrid");
@@ -1465,6 +1426,228 @@ fn pairs_match_brute_force() {
     check_pairs::<LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>>("LooseQuadTree");
     check_pairs::<Sweep<false>>("SortAndSweep");
     check_pairs::<Sweep<true>>("SortAndSweep, scalar");
+}
+
+/// Event order and active set of each `JoinSweep` case.
+const JOIN_SWEEP_CASES: [(EventOrder, ActiveSet); 6] = [
+    (EventOrder::Sorted, ActiveSet::BTree),
+    (EventOrder::Sorted, ActiveSet::SortedVec),
+    (EventOrder::Kept, ActiveSet::BTree),
+    (EventOrder::Kept, ActiveSet::SortedVec),
+    (EventOrder::Sorted, ActiveSet::Cells(8.0)),
+    (EventOrder::Kept, ActiveSet::Cells(32.0)),
+];
+
+/// `SpatialJoinSweep`, which needs no world, with the case `C` of
+/// `JOIN_SWEEP_CASES` and the world of the checks as its root.
+struct JoinSweep<const C: usize> {
+    sweep: SpatialJoinSweep<usize>,
+    world: Rectangle,
+}
+
+impl<const C: usize> OverflowBounded for JoinSweep<C> {
+    fn create(world: Rectangle, _fit: bool) -> Self {
+        let (order, active) = JOIN_SWEEP_CASES[C];
+        Self {
+            sweep: SpatialJoinSweep::new(order, active),
+            world,
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.world.clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.sweep.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.sweep.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.sweep.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.sweep.search(bounds, callback);
+    }
+    fn refresh(&mut self) {
+        self.sweep.refresh_order();
+    }
+}
+
+impl<const C: usize> PairQuery for JoinSweep<C> {
+    fn pairs(&self, callback: &mut dyn FnMut(usize, usize)) {
+        self.sweep.for_each_pair(|a, b| callback(a, b));
+    }
+}
+
+/// The port of spatialjoin's sweep, in every variant, both stale and
+/// refreshed, with duplicates and items paired with themselves caught.
+#[test]
+fn spatial_join_sweep_matches_brute_force() {
+    macro_rules! cases {
+        ($($case:literal),*) => {
+            $(
+                let name = format!("SpatialJoinSweep {:?}", JOIN_SWEEP_CASES[$case]);
+                check_tight_bounds::<JoinSweep<$case>>(&name);
+                check_pairs::<JoinSweep<$case>>(&name);
+            )*
+        };
+    }
+    cases!(0, 1, 2, 3, 4, 5);
+}
+
+/// Packing, node size, coherent rebuilds and deferred share of each `Packed`
+/// case.
+#[cfg(feature = "packed")]
+const PACKED_CASES: [(external::Packing, usize, bool, f64); 11] = [
+    (external::Packing::StaticHilbert, 16, false, 0.0),
+    (external::Packing::StaticHilbert, 16, true, 0.0),
+    (external::Packing::StaticHilbertJoin, 16, false, 0.0),
+    (external::Packing::StaticHilbertJoin, 3, true, 0.0),
+    (external::Packing::GeoHilbert, 16, false, 0.0),
+    (external::Packing::GeoHilbert, 16, true, 0.0),
+    (external::Packing::GeoStr, 16, false, 0.0),
+    (external::Packing::GeoHilbertWalk, 16, false, 0.0),
+    (external::Packing::GeoHilbertWalk, 4, false, 0.0),
+    // Deferred so far that the shared checks, which change most items
+    // between refreshes, still find stale entries in the tree.
+    (external::Packing::StaticHilbertJoin, 3, true, 4.0),
+    (external::Packing::GeoHilbert, 16, false, 4.0),
+];
+
+/// A packed R-tree, which needs no world, with the case `C` of
+/// `PACKED_CASES` and the world of the checks as its root.
+#[cfg(feature = "packed")]
+struct Packed<const C: usize> {
+    tree: external::PackedRTree<usize>,
+    world: Rectangle,
+}
+
+#[cfg(feature = "packed")]
+impl<const C: usize> OverflowBounded for Packed<C> {
+    fn create(world: Rectangle, _fit: bool) -> Self {
+        let (packing, node_size, coherent, defer) = PACKED_CASES[C];
+        let tree = external::PackedRTree::with_node_size(packing, node_size).deferred(defer);
+        Self {
+            tree: if coherent { tree.coherent() } else { tree },
+            world,
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.world.clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.tree.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.tree.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.tree.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.tree.search(bounds, callback);
+    }
+    fn refresh(&mut self) {
+        self.tree.refresh_tree();
+    }
+}
+
+#[cfg(feature = "packed")]
+impl<const C: usize> PairQuery for Packed<C> {
+    fn pairs(&self, callback: &mut dyn FnMut(usize, usize)) {
+        self.tree.for_each_pair(|a, b| callback(a, b));
+    }
+}
+
+/// The adapters of the packed R-trees, both stale and rebuilt.
+#[cfg(feature = "packed")]
+#[test]
+fn packed_rtree_matches_brute_force() {
+    macro_rules! cases {
+        ($($case:literal),*) => {
+            $(
+                let name = format!("PackedRTree {:?}", PACKED_CASES[$case]);
+                check_tight_bounds::<Packed<$case>>(&name);
+                check_pairs::<Packed<$case>>(&name);
+            )*
+        };
+    }
+    cases!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+}
+
+/// Maintenance and margin of each `Parry` case.
+#[cfg(feature = "parry")]
+const PARRY_CASES: [(external::Maintenance, f64); 8] = [
+    (external::Maintenance::Rebuild(external::BvhBuildStrategy::Binned), 0.0),
+    (external::Maintenance::Rebuild(external::BvhBuildStrategy::Ploc), 0.0),
+    (external::Maintenance::Refit, 0.0),
+    (external::Maintenance::RefitOptimize, 0.0),
+    (external::Maintenance::RefitOptimize, 3.0),
+    (external::Maintenance::OptimizeRefit, 0.0),
+    (external::Maintenance::OptimizeRefit, 3.0),
+    (external::Maintenance::Reinsert, 3.0),
+];
+
+/// parry2d-f64's tree, which needs no world, with the case `C` of
+/// `PARRY_CASES` and the world of the checks as its root.
+#[cfg(feature = "parry")]
+struct Parry<const C: usize> {
+    tree: external::ParryBvh<usize>,
+    world: Rectangle,
+}
+
+#[cfg(feature = "parry")]
+impl<const C: usize> OverflowBounded for Parry<C> {
+    fn create(world: Rectangle, _fit: bool) -> Self {
+        let (maintenance, margin) = PARRY_CASES[C];
+        Self {
+            tree: external::ParryBvh::new(maintenance, margin),
+            world,
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.world.clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.tree.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.tree.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.tree.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.tree.search(bounds, callback);
+    }
+    fn refresh(&mut self) {
+        self.tree.refresh_tree();
+    }
+}
+
+#[cfg(feature = "parry")]
+impl<const C: usize> PairQuery for Parry<C> {
+    fn pairs(&self, callback: &mut dyn FnMut(usize, usize)) {
+        self.tree.for_each_pair(|a, b| callback(a, b));
+    }
+}
+
+/// The adapter of parry2d-f64's tree, under every maintenance, both pending
+/// and refreshed: searches with items that overlap a query by a single
+/// float, and pairs with duplicates and items paired with themselves caught.
+#[cfg(feature = "parry")]
+#[test]
+fn parry_bvh_matches_brute_force() {
+    macro_rules! cases {
+        ($($case:literal),*) => {
+            $(
+                let name = format!("ParryBvh {:?}", PARRY_CASES[$case]);
+                check_tight_bounds::<Parry<$case>>(&name);
+                check_pairs::<Parry<$case>>(&name);
+            )*
+        };
+    }
+    cases!(0, 1, 2, 3, 4, 5, 6, 7);
 }
 
 #[test]
@@ -1475,7 +1658,6 @@ fn self_queries_match_brute_force() {
     check_self_query::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>("SpanOverflowBoundGrid");
     check_self_query::<HaloOverflowBoundGrid<usize, MAX_LEVEL>>("HaloOverflowBoundGrid");
     check_self_query::<HierarchicalLooseGrid<usize, MAX_LEVEL>>("HierarchicalLooseGrid");
-    check_self_query::<HierarchicalGrid<usize, MAX_LEVEL>>("HierarchicalGrid");
     check_self_query::<UniformGrid<usize>>("UniformGrid");
     check_self_query::<TwoLayerGrid<usize>>("TwoLayerGrid");
     check_self_query::<MultiGrid<usize>>("MultiGrid");
@@ -1550,22 +1732,4 @@ fn positions_follow_the_size_levels() {
         SpanOverflowBoundGrid,
         HaloOverflowBoundGrid
     );
-    // The hierarchical grid always covers the world with a square region,
-    // whose longer side alone decides; the definition is the same.
-    for world in FITTED_WORLDS {
-        let tree = HierarchicalGrid::<usize, MAX_LEVEL>::new(world.clone());
-        let root = tree.get_bounds();
-        let mut rng = StdRng::seed_from_u64(23);
-        for _ in 0..20000 {
-            let (x, y) = world.scale(1.1).get_random_point(&mut rng);
-            let width = random_side(&mut rng, root.get_width());
-            let height = random_side(&mut rng, root.get_height());
-            let bounds = Rectangle::center_rect(x, y, width, height);
-            assert_eq!(
-                tree.position(&bounds).0,
-                level_by_division(&root, &world, &bounds),
-                "HierarchicalGrid, world {world:?}, bounds {bounds:?}"
-            );
-        }
-    }
 }

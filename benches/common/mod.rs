@@ -1,6 +1,7 @@
 //! Constants and the common interface of the structures, shared by the
 //! benchmarks.
 
+use lib::external::*;
 use lib::rect::*;
 use lib::*;
 
@@ -17,6 +18,12 @@ pub const SEED: u64 = 0;
 // balls that do not double sit on the finest level.
 pub const MIN_RADIUS: f64 = 25.0;
 pub const MAX_RADIUS: f64 = 50.0;
+
+/// Speeds of the moving balls, in units per frame.
+#[allow(dead_code, reason = "unused by the search benchmarks")]
+pub const MIN_VELOCITY: f64 = 1.0;
+#[allow(dead_code, reason = "unused by the search benchmarks")]
+pub const MAX_VELOCITY: f64 = 5.0;
 
 pub const BOUNDS: Rectangle = Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT);
 
@@ -97,7 +104,6 @@ qtree!(HaloOverflowBoundGrid<T, const MAX_LEVEL: u8>, refresh_bounds);
 qtree!(UniformGrid<T>);
 qtree!(TwoLayerGrid<T>);
 qtree!(MultiGrid<T>);
-qtree!(HierarchicalGrid<T, const MAX_LEVEL: u8>);
 qtree!(SpanGrid<T>, refresh_bounds);
 qtree!(HaloGrid<T>, refresh_bounds);
 qtree!(SortAndSweep<T>, refresh_order);

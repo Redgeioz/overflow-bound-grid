@@ -218,20 +218,19 @@ impl<T: Copy> TwoLayerGrid<T> {
         }
     }
 
-    /// Search with the bounds of every stored item, as [`search`](Self::search)
-    /// would item by item, and call `callback` with the item searched for and
-    /// each item found, the searched one included. The objects are taken cell
-    /// by cell in Morton order, each from class A of the first cell of its
-    /// range, so that consecutive searches read nearby cells. It visits every
-    /// cell, so where cells far outnumber objects, searching item by item is
-    /// faster.
-    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
-        let cols = self.cols;
-        for_each_cell_in_morton_order(cols, self.rows, |x, y| {
-            for entry in &self.cells[y * cols + x].classes[A] {
-                self.search(&entry.bounds, |found| callback(entry.item, found));
-            }
-        });
+    /// Call `callback` with every stored item and each stored item whose bounds
+    /// intersect its own, the item itself included where its bounds meet
+    /// themselves: what searching with the bounds of every item reports. The
+    /// results come from the walk of [`for_each_pair`](Self::for_each_pair),
+    /// each pair in both orders; the results of one query are not reported
+    /// together. Unlike a search, it never reports an item with a NaN
+    /// coordinate, which meets nothing. The walk visits every cell, so where
+    /// cells far outnumber items, searching item by item is faster. On the
+    /// search bench's distribution, the `self_query` bench group measured 0.31
+    /// ms, against 0.78 ms for the previous implementation, which searched with
+    /// the bounds of every item in turn, cell by cell.
+    pub fn for_each_self_query(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<true>(callback);
     }
 
     /// Call `callback` once for every pair of distinct stored items whose
@@ -241,14 +240,31 @@ impl<T: Copy> TwoLayerGrid<T> {
     /// and B-C are joined, as in the paper's spatial joins, and every pair is
     /// tested once without a duplicate check. The cells are visited in Morton
     /// order.
-    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+    pub fn for_each_pair(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<false>(callback);
+    }
+
+    /// The walk of [`for_each_pair`](Self::for_each_pair) and, with
+    /// `SELF_QUERY`, of [`for_each_self_query`](Self::for_each_self_query),
+    /// which reports each pair in both orders and each item with itself where
+    /// its bounds meet themselves. Inlined into both, so that each compiles
+    /// to a walk of its own.
+    #[inline(always)]
+    fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let cols = self.cols;
         for_each_cell_in_morton_order(cols, self.rows, |x, y| {
             let [a, b, c, d] = &self.cells[y * cols + x].classes;
             for (index, entry) in a.iter().enumerate() {
+                // Every object is in class A of exactly one cell, its first.
+                if SELF_QUERY && entry.bounds.intersects(&entry.bounds) {
+                    callback(entry.item, entry.item);
+                }
                 for other in &a[index + 1..] {
                     if entry.bounds.intersects(&other.bounds) {
                         callback(entry.item, other.item);
+                        if SELF_QUERY {
+                            callback(other.item, entry.item);
+                        }
                     }
                 }
             }
@@ -257,6 +273,9 @@ impl<T: Copy> TwoLayerGrid<T> {
                     for other in right {
                         if entry.bounds.intersects(&other.bounds) {
                             callback(entry.item, other.item);
+                            if SELF_QUERY {
+                                callback(other.item, entry.item);
+                            }
                         }
                     }
                 }

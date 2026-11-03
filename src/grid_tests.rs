@@ -693,6 +693,205 @@ macro_rules! span_tests {
                 }
             }
         }
+
+        /// Assert that `tree` holds no marks and the boxes and spans computed
+        /// from its items, and whatever its `assert_refreshed_extra` adds.
+        fn assert_refreshed(tree: &Tree, context: &str) {
+            for level in 1..=MAX_LEVEL as usize {
+                let context = format!("{context}, level {level}");
+                let lines = &tree.lines[level];
+                assert!(level_marks_clear(tree, level), "{context}");
+                assert!(lines.row_touched.iter().all(|&touched| !touched), "{context}");
+                assert_eq!(lines.marks.marked(), (Vec::new(), false), "{context}");
+                let occupied = tree.layers[level].iter().filter(|node| !node.items.is_empty()).count();
+                assert_eq!(lines.marks.occupied(), occupied, "{context}");
+                for (index, node) in tree.layers[level].iter().enumerate() {
+                    assert_eq!(node.bounds, union(node), "{context}, node {index}");
+                }
+                let (columns, rows) = exact_spans(tree, level);
+                assert_eq!(&lines.columns[..], &columns[..], "{context}");
+                assert_eq!(&lines.rows[..], &rows[..], "{context}");
+                assert_refreshed_extra(tree, level, &context);
+            }
+        }
+
+        /// A box with a NaN, infinite or signed-zero side, inverted, or
+        /// empty, near a random point of `root`.
+        fn odd_bounds(rng: &mut StdRng, root: &Rectangle) -> Rectangle {
+            let (x, y) = root.get_random_point(rng);
+            let size = root.get_width() / 64.0;
+            match rng.gen_range(0..6) {
+                0 => Rectangle::new(f64::NAN, y, x + size, y + size),
+                1 => Rectangle::new(x, y, f64::INFINITY, y + size),
+                2 => Rectangle::new(x + size, y + size, x, y),
+                3 => Rectangle::new(x, y, x, y),
+                4 => Rectangle::new(-0.0, y, size, y + size),
+                _ => Rectangle::new(0.0, -0.0, size, size),
+            }
+        }
+
+        /// The same random insertions, nudges, jumps and removals go to three
+        /// trees, refreshed after every few of them: one visiting only the
+        /// marked nodes of every level, one sweeping every level row by row,
+        /// and one choosing per level as `refresh_bounds` does. After every
+        /// refresh each must hold no marks and the boxes and spans computed
+        /// from its items, and the three must give the same searches and
+        /// pairs. One insertion in twenty is a box with a NaN, infinite or
+        /// signed-zero side, inverted or empty. Single operations and bursts
+        /// of hundreds alternate, so that both ways see few and many marked
+        /// nodes, and with a few hundred items on 4096 finest nodes, nodes
+        /// keep emptying and filling again.
+        #[test]
+        fn refresh_node_by_node_matches_row_by_row() {
+            let mut rng = StdRng::seed_from_u64(9);
+            for world in WORLDS {
+                for fit in [false, true] {
+                    let make = || {
+                        if fit {
+                            Tree::new_fit(world.clone())
+                        } else {
+                            Tree::new(world.clone())
+                        }
+                    };
+                    let mut trees = [make(), make(), make()];
+                    let root = trees[0].get_bounds().clone();
+                    let mut items: Vec<([ItemHandle; 3], Rectangle)> = Vec::new();
+                    for round in 0..300 {
+                        let operations = if rng.gen_bool(0.2) {
+                            rng.gen_range(50..400)
+                        } else {
+                            rng.gen_range(1..6)
+                        };
+                        for step in 0..operations {
+                            let choice = match items.len() {
+                                0 => 0,
+                                600.. => 4,
+                                _ => rng.gen_range(0..5),
+                            };
+                            match choice {
+                                0 | 1 => {
+                                    let bounds = if rng.gen_bool(0.05) {
+                                        odd_bounds(&mut rng, &root)
+                                    } else {
+                                        random_bounds(&mut rng, &root)
+                                    };
+                                    let handles = trees
+                                        .each_mut()
+                                        .map(|tree| tree.insert(bounds.clone(), round * 1000 + step));
+                                    items.push((handles, bounds));
+                                }
+                                2 | 3 => {
+                                    let index = rng.gen_range(0..items.len());
+                                    let (handles, old) = &items[index];
+                                    let bounds = if rng.gen_bool(0.7) {
+                                        nudge(&mut rng, old)
+                                    } else {
+                                        random_bounds(&mut rng, &root)
+                                    };
+                                    for (tree, &handle) in trees.iter_mut().zip(handles) {
+                                        tree.update(bounds.clone(), handle);
+                                    }
+                                    items[index].1 = bounds;
+                                }
+                                _ => {
+                                    let (handles, _) = items.swap_remove(rng.gen_range(0..items.len()));
+                                    for (tree, handle) in trees.iter_mut().zip(handles) {
+                                        tree.remove(handle);
+                                    }
+                                }
+                            }
+                        }
+                        let [by_node, by_row, chosen] = &mut trees;
+                        by_node.refresh_with(|_, _, _| true);
+                        by_row.refresh_with(|_, _, _| false);
+                        chosen.refresh_bounds();
+                        for (name, tree) in [("by node", &trees[0]), ("by row", &trees[1]), ("chosen", &trees[2])] {
+                            assert_refreshed(tree, &format!("fit {fit}, {world:?}, round {round}, {name}"));
+                        }
+                        let found = |tree: &Tree, query: &Rectangle| {
+                            let mut found = Vec::new();
+                            tree.search(query, |id| found.push(id));
+                            found.sort_unstable();
+                            found
+                        };
+                        for _ in 0..8 {
+                            let query = random_bounds(&mut rng, &root);
+                            let expected = found(&trees[0], &query);
+                            assert_eq!(found(&trees[1], &query), expected, "round {round}, {query:?}");
+                            assert_eq!(found(&trees[2], &query), expected, "round {round}, {query:?}");
+                        }
+                        if round % 10 == 0 {
+                            let pairs = |tree: &Tree| {
+                                let mut pairs = Vec::new();
+                                tree.for_each_pair(|a, b| pairs.push((a.min(b), a.max(b))));
+                                pairs.sort_unstable();
+                                pairs
+                            };
+                            let expected = pairs(&trees[0]);
+                            assert_eq!(pairs(&trees[1]), expected, "round {round}");
+                            assert_eq!(pairs(&trees[2]), expected, "round {round}");
+                        }
+                    }
+                }
+            }
+        }
+
+        /// A node that empties gives up the ends of its column's and row's
+        /// spans that it held, also when the refresh visits only the marked
+        /// nodes, which cannot tell them from its box.
+        #[test]
+        fn emptied_node_gives_up_its_span_ends() {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
+            let finest = MAX_LEVEL as usize;
+            // Finest nodes are 16 units wide: (6, 6) and (9, 6), in one row.
+            let reaching = Rectangle::center_rect(100.0, 100.0, 10.0, 14.0);
+            let other = Rectangle::center_rect(150.0, 100.0, 4.0, 4.0);
+            assert_eq!(tree.position(&reaching), (finest, 6, 6));
+            assert_eq!(tree.position(&other), (finest, 9, 6));
+            let handle = tree.insert(reaching, 0);
+            tree.insert(other, 1);
+            tree.refresh_with(|_, _, _| true);
+            assert_eq!(tree.lines[finest].rows[6], [93.0, 107.0]);
+            assert_eq!(tree.lines[finest].columns[6], [95.0, 105.0]);
+            tree.remove(handle);
+            tree.refresh_with(|_, _, _| true);
+            assert_eq!(tree.lines[finest].rows[6], [98.0, 102.0]);
+            assert_eq!(tree.lines[finest].columns[6], NOWHERE);
+            assert_refreshed(&tree, "after the removal");
+        }
+
+        /// Storing, replacing and taking an item marks its node, and a
+        /// refresh clears the marks either way.
+        #[test]
+        fn node_marks_follow_stores_and_takes() {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
+            let finest = MAX_LEVEL as usize;
+            let marked = |tree: &Tree| tree.lines[finest].marks.marked().0;
+            // Finest nodes are 16 units wide, 64 to a row.
+            let node = |x: usize, y: usize| y * 64 + x;
+
+            let handle = tree.insert(Rectangle::center_rect(100.0, 100.0, 4.0, 4.0), 0);
+            assert_eq!(marked(&tree), [node(6, 6)]);
+            tree.refresh_bounds();
+            assert_eq!(marked(&tree), []);
+
+            // Replaced in its node.
+            tree.update(Rectangle::center_rect(101.0, 100.0, 4.0, 4.0), handle);
+            assert_eq!(marked(&tree), [node(6, 6)]);
+            tree.refresh_with(|_, _, _| false);
+            assert_eq!(marked(&tree), []);
+
+            // Moved to the node below and to the right: stored there, taken here.
+            tree.update(Rectangle::center_rect(120.0, 116.0, 4.0, 4.0), handle);
+            assert_eq!(marked(&tree), [node(6, 6), node(7, 7)]);
+            tree.refresh_with(|_, _, _| true);
+            assert_eq!(marked(&tree), []);
+
+            tree.remove(handle);
+            assert_eq!(marked(&tree), [node(7, 7)]);
+            tree.refresh_bounds();
+            assert_eq!(marked(&tree), []);
+        }
     };
 }
 pub(crate) use span_tests;
@@ -882,6 +1081,210 @@ macro_rules! single_level_tests {
             tree.insert(Rectangle::center_rect(500.0, 500.0, 100.1, 10.0), 2);
             tree.insert(Rectangle::center_rect(-1.0, 500.0, 10.0, 10.0), 3);
             assert_eq!(tree.overflow.items.len(), 2);
+        }
+
+        /// Assert that `tree` holds no marks and the boxes and spans computed
+        /// from its items, and whatever its `assert_refreshed_extra` adds.
+        fn assert_refreshed(tree: &Tree, context: &str) {
+            assert!(marks_clear(tree), "{context}");
+            assert!(tree.lines.row_touched.iter().all(|&touched| !touched), "{context}");
+            assert_eq!(tree.marks.marked(), (Vec::new(), false), "{context}");
+            let occupied = tree.cells.iter().filter(|cell| !cell.items.is_empty()).count();
+            assert_eq!(tree.marks.occupied(), occupied, "{context}");
+            assert_covering(tree, true);
+            let mut overflow = EMPTY;
+            for entry in &tree.overflow.items {
+                overflow.min_x = overflow.min_x.min(entry.bounds.min_x);
+                overflow.min_y = overflow.min_y.min(entry.bounds.min_y);
+                overflow.max_x = overflow.max_x.max(entry.bounds.max_x);
+                overflow.max_y = overflow.max_y.max(entry.bounds.max_y);
+            }
+            assert_eq!(tree.overflow.bounds, overflow, "{context}");
+            assert_refreshed_extra(tree, context);
+        }
+
+        /// A box with a NaN, infinite or signed-zero side, inverted, or
+        /// empty, near a random point of `world`, at most a cell wide.
+        fn odd_bounds(rng: &mut StdRng, world: &Rectangle, cell: f64) -> Rectangle {
+            let (x, y) = world.get_random_point(rng);
+            let size = cell * 0.5;
+            match rng.gen_range(0..6) {
+                0 => Rectangle::new(f64::NAN, y, x + size, y + size),
+                1 => Rectangle::new(x, y, f64::INFINITY, y + size),
+                2 => Rectangle::new(x + size, y + size, x, y),
+                3 => Rectangle::new(x, y, x, y),
+                4 => Rectangle::new(-0.0, y, size, y + size),
+                _ => Rectangle::new(0.0, -0.0, size, size),
+            }
+        }
+
+        /// The same random insertions, moves and removals go to three grids,
+        /// refreshed after every few of them: one visiting only the marked
+        /// cells, one sweeping the rows, and one choosing as `refresh_bounds`
+        /// does. After every refresh each must hold no marks and the boxes and
+        /// spans computed from its items, and the three must give the same
+        /// searches and pairs. One insertion in twenty is a box with a NaN,
+        /// infinite or signed-zero side, inverted or empty. Single operations
+        /// and bursts of hundreds alternate, and cells keep emptying and
+        /// filling again.
+        #[test]
+        fn refresh_cell_by_cell_matches_row_by_row() {
+            let mut rng = StdRng::seed_from_u64(9);
+            for world in WORLDS {
+                // About 32 and 80 cells to a row, whatever the world's size.
+                for cell in [world.get_width() / 32.0, world.get_width() / 80.0] {
+                    let mut trees = [
+                        Tree::new(world.clone(), cell),
+                        Tree::new(world.clone(), cell),
+                        Tree::new(world.clone(), cell),
+                    ];
+                    let mut items: Vec<([ItemHandle; 3], Rectangle)> = Vec::new();
+                    for round in 0..300 {
+                        let operations = if rng.gen_bool(0.2) {
+                            rng.gen_range(50..400)
+                        } else {
+                            rng.gen_range(1..6)
+                        };
+                        for step in 0..operations {
+                            let choice = match items.len() {
+                                0 => 0,
+                                600.. => 4,
+                                _ => rng.gen_range(0..5),
+                            };
+                            match choice {
+                                0 | 1 => {
+                                    let bounds = if rng.gen_bool(0.05) {
+                                        odd_bounds(&mut rng, &world, cell)
+                                    } else {
+                                        random_bounds(&mut rng, &world, cell)
+                                    };
+                                    let handles = trees
+                                        .each_mut()
+                                        .map(|tree| tree.insert(bounds.clone(), round * 1000 + step));
+                                    items.push((handles, bounds));
+                                }
+                                2 | 3 => {
+                                    let index = rng.gen_range(0..items.len());
+                                    let (handles, old) = &items[index];
+                                    let bounds = if rng.gen_bool(0.7) {
+                                        let (x, y) = old.get_center();
+                                        Rectangle::center_rect(
+                                            x + rng.gen_range(-0.2..0.2) * cell,
+                                            y + rng.gen_range(-0.2..0.2) * cell,
+                                            old.get_width() * rng.gen_range(0.8..1.2),
+                                            old.get_height() * rng.gen_range(0.8..1.2),
+                                        )
+                                    } else {
+                                        random_bounds(&mut rng, &world, cell)
+                                    };
+                                    for (tree, &handle) in trees.iter_mut().zip(handles) {
+                                        tree.update(bounds.clone(), handle);
+                                    }
+                                    items[index].1 = bounds;
+                                }
+                                _ => {
+                                    let (handles, _) = items.swap_remove(rng.gen_range(0..items.len()));
+                                    for (tree, handle) in trees.iter_mut().zip(handles) {
+                                        tree.remove(handle);
+                                    }
+                                }
+                            }
+                        }
+                        let [by_cell, by_row, chosen] = &mut trees;
+                        by_cell.refresh_with(|_, _, _| true);
+                        by_row.refresh_with(|_, _, _| false);
+                        chosen.refresh_bounds();
+                        for (name, tree) in [("by cell", &trees[0]), ("by row", &trees[1]), ("chosen", &trees[2])] {
+                            assert_refreshed(tree, &format!("cell {cell}, {world:?}, round {round}, {name}"));
+                        }
+                        let found = |tree: &Tree, query: &Rectangle| {
+                            let mut found = Vec::new();
+                            tree.search(query, |id| found.push(id));
+                            found.sort_unstable();
+                            found
+                        };
+                        for _ in 0..8 {
+                            let query = random_bounds(&mut rng, &world, cell);
+                            let expected = found(&trees[0], &query);
+                            assert_eq!(found(&trees[1], &query), expected, "round {round}, {query:?}");
+                            assert_eq!(found(&trees[2], &query), expected, "round {round}, {query:?}");
+                        }
+                        if round % 10 == 0 {
+                            let pairs = |tree: &Tree| {
+                                let mut pairs = Vec::new();
+                                tree.for_each_pair(|a, b| pairs.push((a.min(b), a.max(b))));
+                                pairs.sort_unstable();
+                                pairs
+                            };
+                            let expected = pairs(&trees[0]);
+                            assert_eq!(pairs(&trees[1]), expected, "round {round}");
+                            assert_eq!(pairs(&trees[2]), expected, "round {round}");
+                        }
+                    }
+                }
+            }
+        }
+
+        /// A cell that empties gives up the ends of its column's and row's
+        /// spans that it held, also when the refresh visits only the marked
+        /// cells, which cannot tell them from its box.
+        #[test]
+        fn emptied_cell_gives_up_its_span_ends() {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0), 16.0);
+            // Cells are 16 units wide: (6, 6) and (9, 6), in one row.
+            let reaching = Rectangle::center_rect(100.0, 100.0, 10.0, 14.0);
+            let other = Rectangle::center_rect(150.0, 100.0, 4.0, 4.0);
+            assert_eq!(tree.position(&reaching), (1, 6, 6));
+            assert_eq!(tree.position(&other), (1, 9, 6));
+            let handle = tree.insert(reaching, 0);
+            tree.insert(other, 1);
+            tree.refresh_with(|_, _, _| true);
+            assert_eq!(tree.lines.rows[6], [93.0, 107.0]);
+            assert_eq!(tree.lines.columns[6], [95.0, 105.0]);
+            tree.remove(handle);
+            tree.refresh_with(|_, _, _| true);
+            assert_eq!(tree.lines.rows[6], [98.0, 102.0]);
+            assert_eq!(tree.lines.columns[6], NOWHERE);
+            assert_refreshed(&tree, "after the removal");
+        }
+
+        /// Storing, replacing and taking an item marks its cell, an item of
+        /// the overflow node marks none, and a refresh clears the marks either
+        /// way.
+        #[test]
+        fn cell_marks_follow_stores_and_takes() {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0), 16.0);
+            let marked = |tree: &Tree| tree.marks.marked().0;
+            // Cells are 16 units wide, 64 to a row.
+            let cell = |x: usize, y: usize| y * 64 + x;
+
+            let handle = tree.insert(Rectangle::center_rect(100.0, 100.0, 4.0, 4.0), 0);
+            assert_eq!(marked(&tree), [cell(6, 6)]);
+            tree.refresh_bounds();
+            assert_eq!(marked(&tree), []);
+
+            // Replaced in its cell.
+            tree.update(Rectangle::center_rect(101.0, 100.0, 4.0, 4.0), handle);
+            assert_eq!(marked(&tree), [cell(6, 6)]);
+            tree.refresh_with(|_, _, _| false);
+            assert_eq!(marked(&tree), []);
+
+            // Moved to the cell below and to the right: stored there, taken here.
+            tree.update(Rectangle::center_rect(120.0, 116.0, 4.0, 4.0), handle);
+            assert_eq!(marked(&tree), [cell(6, 6), cell(7, 7)]);
+            tree.refresh_with(|_, _, _| true);
+            assert_eq!(marked(&tree), []);
+
+            // Grown past a cell: stored in the overflow node, taken here.
+            tree.update(Rectangle::center_rect(120.0, 116.0, 40.0, 40.0), handle);
+            assert_eq!(marked(&tree), [cell(7, 7)]);
+            tree.refresh_bounds();
+            assert_eq!(marked(&tree), []);
+
+            tree.remove(handle);
+            assert_eq!(marked(&tree), []);
+            tree.refresh_bounds();
+            assert_refreshed(&tree, "at the end");
         }
     };
 }

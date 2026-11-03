@@ -4,6 +4,7 @@ use crate::layer_geometry::{
     LayerGeometry, Levels, build_levels, half_node_corners, scan_range, size_level,
 };
 use crate::exact_overflow_bound_grid::DirectionalOverflow;
+use crate::node_marks::{BoxedNode, NodeMarks};
 use crate::overflow_bound::{cell_overflow, higher, lower};
 use crate::rect::{EMPTY, NOWHERE, Rectangle};
 use grid::*;
@@ -43,6 +44,8 @@ type Layers<T> = Vec<Grid<HaloOverflowBoundGridNode<T>>>;
 /// stay valid as items move, shrink or leave, but tighten only in
 /// [`refresh_bounds`], which also brings the copies up to date and clears
 /// the marks; the caller chooses when, e.g. once per frame after the updates.
+/// Every store and take also marks its node, so that when few nodes changed,
+/// the refresh visits only those and their neighbors' copies of them.
 ///
 /// The walk also stops at the coarsest level below the root that holds items,
 /// which a bitmask of the occupied levels keeps exact at all times.
@@ -180,21 +183,35 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         }
     }
 
-    /// On every level changed since the last refresh, shrink the boxes and
-    /// row spans of the touched rows to the items held now, rebuild every
-    /// column span from the boxes, set the copies in and next to the touched
-    /// rows to the sides of the shrunk boxes, and clear the marks of the
+    /// On every level changed since the last refresh, shrink the boxes of the
+    /// nodes that items were stored in, replaced in or taken from to the items
+    /// held now, bring the copies of their sides in their neighbors and the
+    /// spans of their columns and rows up to date, and clear the marks of the
     /// level. This undoes the growth from items that have since moved, shrunk
-    /// or left. Visits every node of such a level once, and the items of its
-    /// touched rows; a level nothing was stored in or taken from is already
-    /// exact and is skipped.
+    /// or left. A level nothing was stored in or taken from is already exact
+    /// and is skipped. Either way of refreshing a level below leaves the
+    /// boxes, spans and copies computed from the items (a span end at zero
+    /// may keep either sign, which no comparison tells apart).
     ///
-    /// A refreshed box is the union of its items, so the spans and copies
-    /// follow from the boxes, one per node rather than one per item. Every
-    /// node pulls the sides it needs from its neighbors, one row behind the
-    /// shrinking, rather than every node pushing its sides to its neighbors,
-    /// which would first require resetting every copy.
+    /// Where at most half the nodes of a level are marked, only the marked
+    /// nodes are visited, after reading every mark: each shrinks its box and
+    /// pushes its sides to the copies its eight neighbors hold of it, and a
+    /// column or row span is rebuilt from its boxes only if a marked node held
+    /// one of its ends and no longer reaches it, or a node in it emptied.
+    /// Otherwise the level is swept row by row, visiting every node once and
+    /// the items of its touched rows: the boxes and row spans of the touched
+    /// rows shrink, every column span is rebuilt from the boxes, and every
+    /// node in or next to a touched row pulls the sides it needs from its
+    /// neighbors, one row behind the shrinking, rather than every node pushing
+    /// its sides, which would first require resetting every copy.
     pub fn refresh_bounds(&mut self) {
+        self.refresh_with(NodeMarks::is_sparse);
+    }
+
+    /// [`refresh_bounds`](Self::refresh_bounds), visiting only the marked
+    /// nodes of a level where `sparse(marked, occupied, all nodes)` holds and sweeping
+    /// it row by row elsewhere.
+    fn refresh_with(&mut self, sparse: impl Fn(usize, usize, usize) -> bool) {
         for level in 1..=MAX_LEVEL as usize {
             if !std::mem::take(&mut self.marks[level]).touched {
                 continue;
@@ -206,68 +223,51 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
                 // Every node reset its box as it emptied; only the spans and
                 // copies remain to reset.
                 lines.clear();
-                lines.row_touched.fill(false);
+                lines.clear_marks();
                 halo.fill(NO_HALO);
                 continue;
             }
-            let rows = grid.rows();
-            // A column span runs across every row, so it is rebuilt from the
-            // boxes of all rows; a row's own span and boxes are rebuilt only
-            // if the row is touched.
-            lines.columns.fill(NOWHERE);
-            let shrink_row = |grid: &mut Grid<HaloOverflowBoundGridNode<T>>,
-                              lines: &mut LineSpan,
-                              y: usize| {
-                if lines.row_touched[y] {
-                    lines.rows[y] = NOWHERE;
-                    for (x, node) in grid[y].iter_mut().enumerate() {
-                        node.refresh();
-                        if !node.items.is_empty() {
-                            lines.widen((x, y), &node.bounds);
-                        }
-                    }
-                } else {
-                    for (x, node) in grid[y].iter().enumerate() {
-                        if !node.items.is_empty() {
-                            lines.widen_column(x, &node.bounds);
-                        }
-                    }
-                }
-            };
-            // The copies of a row read the boxes of that row and the rows on
-            // both sides, so they are pulled one row behind the shrinking,
-            // and only if one of these three rows is touched.
-            shrink_row(grid, lines, 0);
-            for y in 0..rows {
-                if y + 1 < rows {
-                    shrink_row(grid, lines, y + 1);
-                }
-                if lines.near_touched(y) {
-                    pull_halo_row(grid, halo, y);
-                }
+            if sparse(lines.marks.count(), lines.marks.occupied(), grid.cols() * grid.rows()) {
+                let size = (grid.cols(), grid.rows());
+                let LineSpan {
+                    columns,
+                    rows,
+                    row_touched,
+                    marks,
+                } = lines;
+                marks.refresh(grid, columns, rows, |node, bounds| {
+                    push_halo(halo, size, node, bounds)
+                });
+                row_touched.fill(false);
+            } else {
+                refresh_rows(grid, lines, halo);
             }
-            lines.row_touched.fill(false);
         }
     }
 
     /// Record that an item was stored on `level`, so a box there may have
     /// grown past the copies its neighbors hold. `grow_lines`, which every
-    /// store goes through, marks the row.
+    /// store goes through, marks the row and the node.
     #[inline]
     fn mark_stored(&mut self, level: usize) {
         self.marks[level] = Marks::STORED;
     }
 
-    /// Record that an item was taken from row `y` of `level`, so a box or
-    /// span there may be looser than its items.
+    /// Record that an item was taken from node `(x, y)` of `level`, so a box
+    /// or span there may be looser than its items. Run only after
+    /// [`take_entry`](Self::take_entry), which indexes the node with bounds
+    /// checks.
     #[inline]
-    fn mark_taken(&mut self, level: usize, y: usize) {
+    fn mark_taken(&mut self, level: usize, x: usize, y: usize) {
         self.marks[level].touched = true;
-        self.lines[level].row_touched[y] = true;
+        // SAFETY: `take_entry` indexed node `(x, y)` of this level's grid,
+        // whose columns and rows the spans match.
+        unsafe { self.lines[level].touch((x, y)) };
     }
 
     /// Widen the spans of the column and row of `coord` to cover `bounds`
-    /// stored there, and mark the row touched. Every store runs it. Once
+    /// stored there, and mark the row and the node touched. Every store runs
+    /// it. Once
     /// `cover` and the spans grew with `lower` and `higher`, the inliner left
     /// its call in `replace_bounds` out of line; that cost nothing measurable
     /// here, unlike in [`SpanOverflowBoundGrid`](crate::SpanOverflowBoundGrid),
@@ -324,6 +324,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         self.grow_lines(&bounds, coord);
         let grid = &mut self.layers[level];
         let node = &mut grid[y][x];
+        let filled = node.items.is_empty();
         node.grow(&bounds);
         let handle = self
             .slots
@@ -334,6 +335,9 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             handle,
         });
         self.mark_stored(level);
+        if filled {
+            self.lines[level].marks.filled();
+        }
         self.occupy(level);
         handle
     }
@@ -347,7 +351,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         let entry = self.take_entry(level, x, y, location.index as usize);
         debug_assert_eq!(entry.handle, handle);
         self.slots.free(handle);
-        self.mark_taken(level, y);
+        self.mark_taken(level, x, y);
         self.vacate(level);
     }
 
@@ -375,11 +379,15 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         self.grow_lines(&bounds, curt_coord);
         let grid = &mut self.layers[nl];
         let new_node = &mut grid[ny][nx];
+        let filled = new_node.items.is_empty();
         new_node.grow(&bounds);
         *self.slots.get_mut(handle) = GridLocation::new(curt_coord, new_node.items.len());
         new_node.items.push(Entry { bounds, ..entry });
         self.mark_stored(nl);
-        self.mark_taken(level, y);
+        if filled {
+            self.lines[nl].marks.filled();
+        }
+        self.mark_taken(level, x, y);
         self.occupy(nl);
         self.vacate(level);
     }
@@ -427,7 +435,12 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         }
         if node.items.is_empty() {
             // Nothing is left to cover; searches skip the node immediately.
+            // The refresh can then no longer tell whether the box held an end
+            // of its column's or row's span, so both are rebuilt.
             node.bounds = EMPTY;
+            // SAFETY: node `(x, y)` of this level was just indexed with
+            // bounds checks, and the marks match the level's grid.
+            unsafe { self.lines[level].marks.emptied((x, y)) };
         }
         entry
     }
@@ -453,35 +466,23 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             && self.world_bounds.contains_point(center)
     }
 
-    /// Search with the bounds of every stored item, as [`search`](Self::search)
-    /// would item by item, and call `callback` with the item searched for and
-    /// each item found, the searched one included. The items are taken cell
-    /// by cell, depth first through the levels and in Morton order within
-    /// each, so that consecutive searches read nearby cells and the same
-    /// ancestors. The walk stops at the finest level that holds items but
-    /// visits every cell down to it, so where cells far outnumber items,
-    /// searching item by item is faster. On the search bench's distribution,
-    /// the `self_query` bench group measured it 15% faster than searching
-    /// item by item in random order with 10,000 items, and a one-off probe
-    /// outside the repository 43% with 640,000 items at the same
-    /// density, where the random order misses the cache.
-    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
-        let layers = &self.layers;
-        // Levels finer than the finest one holding items need no visit.
-        let Some(finest) =
-            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
-        else {
-            return;
-        };
-        for_each_cell_hierarchically(
-            finest,
-            |level| (layers[level].cols(), layers[level].rows()),
-            |level, x, y| {
-                for entry in &layers[level][y][x].items {
-                    self.search(&entry.bounds, |found| callback(entry.item, found));
-                }
-            },
-        );
+    /// Call `callback` with every stored item and each stored item whose bounds
+    /// intersect its own, the item itself included where its bounds meet
+    /// themselves: what searching with the bounds of every item reports. The
+    /// results come from the walk of [`for_each_pair`](Self::for_each_pair),
+    /// each pair in both orders, so a result across levels is found by the
+    /// coarser item's scan of the finer levels and no item walks up to the
+    /// coarser ones; the results of one query are not reported together. A pair
+    /// that rounding hides from that scan (see
+    /// [`for_each_pair`](Self::for_each_pair)) is missing in both orders, where
+    /// searching item by item misses it only from the other side. The walk
+    /// visits every cell down to the finest level that holds items, so where
+    /// cells far outnumber items, searching item by item is faster. On the
+    /// search bench's distribution, the `self_query` bench group measured 0.27
+    /// ms, against 0.79 ms for the previous implementation, which searched with
+    /// the bounds of every item in turn, cell by cell.
+    pub fn for_each_self_query(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<true>(callback);
     }
 
     /// Call `callback` once for every pair of distinct stored items whose
@@ -492,14 +493,31 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
     /// them; items in the root pair up with the root items after them. Below
     /// its level an item scans the finer levels as a search does, so a pair
     /// across levels is found once, by the item on the coarser level, and no
-    /// item looks above its own level. The nodes are visited as in
-    /// [`for_each_self_query`](Self::for_each_self_query).
+    /// item looks above its own level. The nodes are visited depth first
+    /// through the levels and in Morton order within each, so that
+    /// consecutive items read nearby cells, down to the finest level that
+    /// holds items.
+    ///
+    /// Like the scan of a search, which it copies, the scan of the finer levels
+    /// misses an item that rounding takes a float past the half node that its
+    /// level's items reach, as when its width rounds to the node size and its
+    /// center to a node edge; such a pair is not reported.
     ///
     /// Leaving each cross-level pair to its finer item instead, which walked
     /// the ancestor path as a search does, took 0.56 ms against 0.28 ms on the
     /// mixed distribution: nearly all items lie on the finest level, and each
     /// of them paid for a walk over the occupied levels above it.
-    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+    pub fn for_each_pair(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<false>(callback);
+    }
+
+    /// The walk of [`for_each_pair`](Self::for_each_pair) and, with
+    /// `SELF_QUERY`, of [`for_each_self_query`](Self::for_each_self_query),
+    /// which reports each pair in both orders and each item with itself where
+    /// its bounds meet themselves. Inlined into both, so that each compiles
+    /// to a walk of its own.
+    #[inline(always)]
+    fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let layers = &self.layers;
         // Levels finer than the finest one holding items need no visit.
         let Some(finest) =
@@ -512,7 +530,15 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             |level| (layers[level].cols(), layers[level].rows()),
             |level, x, y| {
                 for (index, entry) in layers[level][y][x].items.iter().enumerate() {
-                    let mut report = |found| callback(entry.item, found);
+                    if SELF_QUERY && entry.bounds.intersects(&entry.bounds) {
+                        callback(entry.item, entry.item);
+                    }
+                    let mut report = |found| {
+                        callback(entry.item, found);
+                        if SELF_QUERY {
+                            callback(found, entry.item);
+                        }
+                    };
                     if level == 1 {
                         self.get_root().pair_with_after(index, &entry.bounds, &mut report);
                     } else {
@@ -1050,11 +1076,13 @@ struct LineSpan {
     columns: Box<[[f64; 2]]>,
     rows: Box<[[f64; 2]]>,
     /// Whether an item was stored in or taken from each row since the last
-    /// refresh. The refresh shrinks the boxes and rebuilds the spans of these
-    /// rows and pulls the copies of them and their neighbor rows again; until
-    /// then, on a stale level, search avoids the copies of a touched row and
-    /// of the rows next to it.
+    /// refresh. A refresh that sweeps the level row by row shrinks the boxes
+    /// and rebuilds the spans of these rows and pulls the copies of them and
+    /// their neighbor rows again; until the refresh, on a stale level, search
+    /// avoids the copies of a touched row and of the rows next to it.
     row_touched: Box<[bool]>,
+    /// The same per node, for a refresh that visits only those.
+    marks: NodeMarks,
 }
 
 impl LineSpan {
@@ -1063,7 +1091,30 @@ impl LineSpan {
             columns: vec![NOWHERE; cols].into_boxed_slice(),
             rows: vec![NOWHERE; rows].into_boxed_slice(),
             row_touched: vec![false; rows].into_boxed_slice(),
+            marks: NodeMarks::new(cols, rows),
         }
+    }
+
+    /// Mark row `y` and node `(x, y)` touched, without bounds checks, as
+    /// every store and take runs this.
+    ///
+    /// # Safety
+    ///
+    /// `x` and `y` must be a column and a row of the level.
+    #[inline]
+    unsafe fn touch(&mut self, (x, y): (usize, usize)) {
+        debug_assert!(y < self.row_touched.len());
+        // SAFETY: by the caller's guarantee.
+        unsafe {
+            *self.row_touched.get_unchecked_mut(y) = true;
+            self.marks.mark((x, y));
+        }
+    }
+
+    /// Clear the marks of the rows and the nodes.
+    fn clear_marks(&mut self) {
+        self.row_touched.fill(false);
+        self.marks.clear();
     }
 
     /// Whether row `y` or a row next to it is touched, the condition under
@@ -1082,11 +1133,12 @@ impl LineSpan {
     }
 
     /// Widen column `x` and row `y` to cover `bounds` stored there, and mark
-    /// the row touched.
+    /// the row and the node touched.
     #[inline]
     fn grow(&mut self, (x, y): (usize, usize), bounds: &Rectangle) {
-        self.row_touched[y] = true;
         self.widen((x, y), bounds);
+        // SAFETY: `widen` indexed column `x` and row `y` with bounds checks.
+        unsafe { self.touch((x, y)) };
     }
 
     /// Widen column `x` and row `y` to cover `bounds` without marking the
@@ -1216,6 +1268,91 @@ unsafe fn box_at<T: Copy>(
     }
 }
 
+/// Refresh one level by sweeping it row by row, as described in
+/// [`HaloOverflowBoundGrid::refresh_bounds`], and clear its marks.
+fn refresh_rows<T: Copy>(
+    grid: &mut Grid<HaloOverflowBoundGridNode<T>>,
+    lines: &mut LineSpan,
+    halo: &mut [Halo],
+) {
+    let rows = grid.rows();
+    // A column span runs across every row, so it is rebuilt from the
+    // boxes of all rows; a row's own span and boxes are rebuilt only
+    // if the row is touched.
+    lines.columns.fill(NOWHERE);
+    let shrink_row = |grid: &mut Grid<HaloOverflowBoundGridNode<T>>,
+                      lines: &mut LineSpan,
+                      y: usize| {
+        if lines.row_touched[y] {
+            lines.rows[y] = NOWHERE;
+            for (x, node) in grid[y].iter_mut().enumerate() {
+                node.refresh();
+                if !node.items.is_empty() {
+                    lines.widen((x, y), &node.bounds);
+                }
+            }
+        } else {
+            for (x, node) in grid[y].iter().enumerate() {
+                if !node.items.is_empty() {
+                    lines.widen_column(x, &node.bounds);
+                }
+            }
+        }
+    };
+    // The copies of a row read the boxes of that row and the rows on
+    // both sides, so they are pulled one row behind the shrinking,
+    // and only if one of these three rows is touched.
+    shrink_row(grid, lines, 0);
+    for y in 0..rows {
+        if y + 1 < rows {
+            shrink_row(grid, lines, y + 1);
+        }
+        if lines.near_touched(y) {
+            pull_halo_row(grid, halo, y);
+        }
+    }
+    lines.clear_marks();
+}
+
+/// Set the copies that the eight neighbors of node `(x, y)` hold of its box
+/// to the facing sides of `bounds`, its box now: the pull of
+/// [`pull_halo_row`] reversed, for one node. Neighbors outside the grid,
+/// whose copies the node has no slot in, are skipped.
+fn push_halo(
+    halo: &mut [Halo],
+    (cols, rows): (usize, usize),
+    (x, y): (usize, usize),
+    bounds: &Rectangle,
+) {
+    let index = y * cols + x;
+    let (has_left, has_right) = (x > 0, x + 1 < cols);
+    let (has_top, has_bottom) = (y > 0, y + 1 < rows);
+    if has_right {
+        halo[index + 1].left = bounds.max_x;
+    }
+    if has_left {
+        halo[index - 1].right = bounds.min_x;
+    }
+    if has_bottom {
+        halo[index + cols].top = bounds.max_y;
+    }
+    if has_top {
+        halo[index - cols].bottom = bounds.min_y;
+    }
+    if has_right && has_bottom {
+        halo[index + cols + 1].top_left = [bounds.max_x, bounds.max_y];
+    }
+    if has_left && has_bottom {
+        halo[index + cols - 1].top_right = [bounds.min_x, bounds.max_y];
+    }
+    if has_right && has_top {
+        halo[index - cols + 1].bottom_left = [bounds.max_x, bounds.min_y];
+    }
+    if has_left && has_top {
+        halo[index - cols - 1].bottom_right = [bounds.min_x, bounds.min_y];
+    }
+}
+
 /// Set the copies in `halo` of every node of row `y` of `grid` to the
 /// facing sides of its neighbors' boxes, which must already be shrunk in
 /// rows `y - 1` to `y + 1`. Interior nodes of the row have both horizontal
@@ -1321,6 +1458,18 @@ impl<T: Copy> HaloOverflowBoundGridNode<T> {
     }
 }
 
+impl<T: Copy> BoxedNode for HaloOverflowBoundGridNode<T> {
+    #[inline]
+    fn bounds(&self) -> &Rectangle {
+        &self.bounds
+    }
+
+    #[inline]
+    fn refresh(&mut self) {
+        HaloOverflowBoundGridNode::refresh(self);
+    }
+}
+
 /// Grow `target` to cover `bounds`. A NaN coordinate leaves its side
 /// unchanged, which is harmless since an item with one intersects no query.
 #[inline]
@@ -1346,6 +1495,17 @@ mod tests {
     ];
 
     crate::grid_tests::span_tests!(HaloOverflowBoundGridNode);
+
+    /// For the shared refresh tests: whether `level` holds no level marks.
+    fn level_marks_clear(tree: &Tree, level: usize) -> bool {
+        tree.marks[level] == Marks::default()
+    }
+
+    /// For the shared refresh tests: the copies of `level` must equal the
+    /// neighbors' boxes right after a refresh.
+    fn assert_refreshed_extra(tree: &Tree, level: usize, context: &str) {
+        assert_eq!(&tree.halo[level][..], &exact_halo(tree, level)[..], "{context}");
+    }
 
     /// Expected copies of every node of `level` right after a refresh,
     /// computed item by item from the neighbors, in storage order.

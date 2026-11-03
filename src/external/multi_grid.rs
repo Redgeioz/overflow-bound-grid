@@ -16,7 +16,7 @@
 //! [`for_each_pair`](MultiGrid::for_each_pair) reports every intersecting
 //! pair once by the pair rules of LAMMPS: a half stencil within a collection
 //! and a one-way search from smaller to larger collections. Region queries
-//! report both directions and use neither.
+//! use neither; the self-query reports those pairs in both orders.
 
 use crate::cell_order::for_each_cell_in_morton_order;
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
@@ -198,23 +198,20 @@ impl<T: Copy> MultiGrid<T> {
         entry
     }
 
-    /// Search with the bounds of every stored item, as [`search`](Self::search)
-    /// would item by item, and call `callback` with the item searched for and
-    /// each item found, the searched one included. The items are taken
-    /// collection by collection, cell by cell in Morton order, then the
-    /// overflow list.
-    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
-        for collection in &self.collections {
-            let cols = collection.cols;
-            for_each_cell_in_morton_order(cols, collection.rows, |x, y| {
-                for entry in &collection.cells[y * cols + x] {
-                    self.search(&entry.bounds, |found| callback(entry.item, found));
-                }
-            });
-        }
-        for entry in &self.overflow {
-            self.search(&entry.bounds, |found| callback(entry.item, found));
-        }
+    /// Call `callback` with every stored item and each stored item whose bounds
+    /// intersect its own, the item itself included where its bounds meet
+    /// themselves: what searching with the bounds of every item reports. The
+    /// results come from the walk of [`for_each_pair`](Self::for_each_pair),
+    /// each pair in both orders, so a result across collections is found by the
+    /// smaller item's search of the larger collection; the results of one query
+    /// are not reported together. The walk visits every cell, so where cells
+    /// far outnumber items, searching item by item is faster. On the search
+    /// bench's distribution with its three collections, a one-off probe outside
+    /// the repository measured 1.09 ms, against 1.49 ms for the previous
+    /// implementation, which searched with the bounds of every item in turn,
+    /// cell by cell.
+    pub fn for_each_self_query(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<true>(callback);
     }
 
     /// Call `callback` once for every pair of distinct stored items whose
@@ -224,14 +221,32 @@ impl<T: Copy> MultiGrid<T> {
     /// half stencil); across collections only the smaller item searches, in
     /// every larger collection (the one-way search). The overflow list counts
     /// as the largest collection. The cells are visited in Morton order.
-    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+    pub fn for_each_pair(&self, callback: impl FnMut(T, T)) {
+        self.pair_walk::<false>(callback);
+    }
+
+    /// The walk of [`for_each_pair`](Self::for_each_pair) and, with
+    /// `SELF_QUERY`, of [`for_each_self_query`](Self::for_each_self_query),
+    /// which reports each pair in both orders and each item with itself where
+    /// its bounds meet themselves. Inlined into both, so that each compiles
+    /// to a walk of its own.
+    #[inline(always)]
+    fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         for (k, collection) in self.collections.iter().enumerate() {
             let cols = collection.cols;
             for_each_cell_in_morton_order(cols, collection.rows, |x, y| {
                 let cell = &collection.cells[y * cols + x];
                 for (index, entry) in cell.iter().enumerate() {
                     let bounds = &entry.bounds;
-                    let mut report = |found| callback(entry.item, found);
+                    if SELF_QUERY && bounds.intersects(bounds) {
+                        callback(entry.item, entry.item);
+                    }
+                    let mut report = |found| {
+                        callback(entry.item, found);
+                        if SELF_QUERY {
+                            callback(found, entry.item);
+                        }
+                    };
                     cell[index + 1..]
                         .iter()
                         .filter(|other| other.bounds.intersects(bounds))
@@ -250,10 +265,18 @@ impl<T: Copy> MultiGrid<T> {
             });
         }
         for (index, entry) in self.overflow.iter().enumerate() {
+            if SELF_QUERY && entry.bounds.intersects(&entry.bounds) {
+                callback(entry.item, entry.item);
+            }
             self.overflow[index + 1..]
                 .iter()
                 .filter(|other| other.bounds.intersects(&entry.bounds))
-                .for_each(|other| callback(entry.item, other.item));
+                .for_each(|other| {
+                    callback(entry.item, other.item);
+                    if SELF_QUERY {
+                        callback(other.item, entry.item);
+                    }
+                });
         }
     }
 
