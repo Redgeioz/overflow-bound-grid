@@ -1135,7 +1135,19 @@ self_query!(
     TwoLayerGrid<usize>,
     MultiGrid<usize>,
     SpanGrid<usize>,
-    HaloGrid<usize>
+    HaloGrid<usize>,
+    ExactOverflowBoundGrid<usize, 2>,
+    BoxedLooseGrid<usize, 2>,
+    LazyOverflowBoundGrid<usize, 2>,
+    SpanOverflowBoundGrid<usize, 2>,
+    HaloOverflowBoundGrid<usize, 2>,
+    HierarchicalLooseGrid<usize, 2>,
+    ExactOverflowBoundGrid<usize, 3>,
+    BoxedLooseGrid<usize, 3>,
+    LazyOverflowBoundGrid<usize, 3>,
+    SpanOverflowBoundGrid<usize, 3>,
+    HaloOverflowBoundGrid<usize, 3>,
+    HierarchicalLooseGrid<usize, 3>
 );
 
 /// Every pair (query, found) the self query reports must be a pair of live
@@ -1233,7 +1245,19 @@ pair_query!(
     TwoLayerGrid<usize>,
     SpanGrid<usize>,
     HaloGrid<usize>,
-    LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>
+    LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>,
+    ExactOverflowBoundGrid<usize, 2>,
+    LazyOverflowBoundGrid<usize, 2>,
+    SpanOverflowBoundGrid<usize, 2>,
+    HaloOverflowBoundGrid<usize, 2>,
+    HierarchicalLooseGrid<usize, 2>,
+    BoxedLooseGrid<usize, 2>,
+    ExactOverflowBoundGrid<usize, 3>,
+    LazyOverflowBoundGrid<usize, 3>,
+    SpanOverflowBoundGrid<usize, 3>,
+    HaloOverflowBoundGrid<usize, 3>,
+    HierarchicalLooseGrid<usize, 3>,
+    BoxedLooseGrid<usize, 3>
 );
 
 impl<const L: u8, const M: usize> OverflowBounded for LooseQuadTree<usize, L, M> {
@@ -1321,6 +1345,470 @@ fn assert_pairs_match_brute_force(
 
 fn check_pairs<Tree: OverflowBounded + PairQuery>(name: &str) {
     check_scenario::<Tree>(name, 17, assert_pairs_match_brute_force);
+}
+
+/// Two items that intersect although rounding makes them look too far apart:
+/// the width of one rounds to a node size and its center to a node edge, so
+/// its level and node are those of an item that stops at the half node past
+/// that edge, while its bounds go a few floats further.
+const ROUNDING_CASES: [(&str, Rectangle, Rectangle, Rectangle); 5] = [
+    // The second item, in the root, ends between the first's bounds and the
+    // half node, so a scan of the first's level stops a node short of it.
+    (
+        "across levels",
+        Rectangle::new(0.0, 0.0, 1024.0, 1024.0),
+        Rectangle::new(255.99999999999994, 10.0, 768.0, 110.0),
+        Rectangle::new(-1000.0, 0.0, 255.99999999999997, 100.0),
+    ),
+    // Both items are on one level, two nodes apart, where neither the 3x3 of
+    // a search nor the half stencil of the pair walk looks.
+    (
+        "two nodes apart",
+        Rectangle::new(-1000.0, -1000.0, 1000.0, 1000.0),
+        Rectangle::new(-250.00000000000009, 10.0, 249.99999999999994, 110.0),
+        Rectangle::new(249.99999999999986, 10.0, 749.9999999999999, 110.0),
+    ),
+    (
+        "two nodes apart, along y",
+        Rectangle::new(-1000.0, -1000.0, 1000.0, 1000.0),
+        Rectangle::new(10.0, -250.00000000000009, 110.0, 249.99999999999994),
+        Rectangle::new(10.0, 249.99999999999986, 110.0, 749.9999999999999),
+    ),
+    // The bounds of the first and the minimum of the second differ by a float
+    // but give the same corner in half nodes, one that the first may not reach
+    // and the second may. The second alone stays within reach, so a search with
+    // the first must find it from a coarser level than the first's size gives.
+    (
+        "the same corner in half nodes",
+        Rectangle::new(-1000.0, -1000.0, 1000.0, 1000.0),
+        Rectangle::new(-250.0000000000001, 10.0, 249.99999999999991, 110.0),
+        Rectangle::new(249.9999999999999, 10.0, 749.9999999999999, 110.0),
+    ),
+    (
+        "the same corner in half nodes, along y",
+        Rectangle::new(-1000.0, -1000.0, 1000.0, 1000.0),
+        Rectangle::new(10.0, -250.0000000000001, 110.0, 249.99999999999991),
+        Rectangle::new(10.0, 249.9999999999999, 110.0, 749.9999999999999),
+    ),
+];
+
+/// Each item of a rounding case finds the other, in a search from either side
+/// and in the one pair of the pair walk, stale and refreshed, and a search with
+/// bounds that are not stored finds the other item alone.
+fn check_rounding_cases<Tree: OverflowBounded + PairQuery>(name: &str) {
+    for (case, world, a, b) in ROUNDING_CASES {
+        assert!(a.intersects(&b), "{case}");
+        for fit in [false, true] {
+            let mut tree = Tree::create(world.clone(), fit);
+            tree.insert_item(a.clone(), 0);
+            tree.insert_item(b.clone(), 1);
+            for state in ["stale", "refreshed"] {
+                let context = format!("{name}, {case}, fit {fit}, {state}");
+                if state == "refreshed" {
+                    tree.refresh();
+                }
+                let mut pairs = Vec::new();
+                tree.pairs(&mut |a, b| pairs.push((a.min(b), a.max(b))));
+                assert_eq!(pairs, [(0, 1)], "{context}: the pair walk");
+                for (query, side) in [(&a, "first"), (&b, "second")] {
+                    let mut found = Vec::new();
+                    tree.search_items(query, &mut |id| found.push(id));
+                    found.sort_unstable();
+                    assert_eq!(found, [0, 1], "{context}: a search with the {side} item");
+                }
+            }
+            for (stored, query, side) in [(&a, &b, "second"), (&b, &a, "first")] {
+                let mut tree = Tree::create(world.clone(), fit);
+                tree.insert_item(stored.clone(), 7);
+                for state in ["stale", "refreshed"] {
+                    if state == "refreshed" {
+                        tree.refresh();
+                    }
+                    let mut found = Vec::new();
+                    tree.search_items(query, &mut |id| found.push(id));
+                    assert_eq!(
+                        found,
+                        [7],
+                        "{name}, {case}, fit {fit}, {state}: a search with the {side} item, not stored"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A single-layer grid of `CELLS` cells along the longer side of the world.
+/// Where cells are as large as the coordinates, rounding of a size to the cell
+/// size happens at all, which the cells of the finest level are too small for.
+struct Coarse<Grid, const CELLS: u32>(Grid);
+
+macro_rules! coarse_grid {
+    ($($grid:ident),*) => {$(
+        impl<const CELLS: u32> OverflowBounded for Coarse<$grid<usize>, CELLS> {
+            fn create(world: Rectangle, _fit: bool) -> Self {
+                let side = world.get_width().max(world.get_height());
+                Self($grid::new(world, side / CELLS as f64))
+            }
+            fn root(&self) -> Rectangle {
+                self.0.get_bounds().clone()
+            }
+            fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+                self.0.insert(bounds, id)
+            }
+            fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+                self.0.update(bounds, handle);
+            }
+            fn remove_item(&mut self, handle: ItemHandle) {
+                self.0.remove(handle);
+            }
+            fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+                self.0.search(bounds, callback);
+            }
+            fn refresh(&mut self) {
+                self.0.refresh_bounds();
+            }
+        }
+
+        impl<const CELLS: u32> PairQuery for Coarse<$grid<usize>, CELLS> {
+            fn pairs(&self, callback: &mut dyn FnMut(usize, usize)) {
+                self.0.for_each_pair(|a, b| callback(a, b));
+            }
+        }
+
+        impl<const CELLS: u32> SelfQuery for Coarse<$grid<usize>, CELLS> {
+            fn self_query(&self, callback: &mut dyn FnMut(usize, usize)) {
+                self.0.for_each_self_query(|query, found| callback(query, found));
+            }
+        }
+    )*};
+}
+coarse_grid!(SpanGrid, HaloGrid);
+
+#[test]
+fn rounding_cases_are_found() {
+    macro_rules! hierarchical {
+        ($($tree:ident),*) => {$(
+            check_rounding_cases::<$tree<usize, 2>>(concat!(stringify!($tree), ", MAX_LEVEL 2"));
+            check_rounding_cases::<$tree<usize, 3>>(concat!(stringify!($tree), ", MAX_LEVEL 3"));
+            check_rounding_cases::<$tree<usize, MAX_LEVEL>>(stringify!($tree));
+        )*};
+    }
+    hierarchical!(
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
+        LazyOverflowBoundGrid,
+        SpanOverflowBoundGrid,
+        HaloOverflowBoundGrid,
+        HierarchicalLooseGrid
+    );
+    check_rounding_cases::<SpanGrid<usize>>("SpanGrid");
+    check_rounding_cases::<HaloGrid<usize>>("HaloGrid");
+    check_rounding_cases::<Coarse<SpanGrid<usize>, 2>>("SpanGrid, 2 cells");
+    check_rounding_cases::<Coarse<HaloGrid<usize>, 2>>("HaloGrid, 2 cells");
+    check_rounding_cases::<Coarse<SpanGrid<usize>, 4>>("SpanGrid, 4 cells");
+    check_rounding_cases::<Coarse<HaloGrid<usize>, 4>>("HaloGrid, 4 cells");
+    check_rounding_cases::<UniformGrid<usize>>("UniformGrid");
+    check_rounding_cases::<TwoLayerGrid<usize>>("TwoLayerGrid");
+    check_rounding_cases::<MultiGrid<usize>>("MultiGrid");
+    check_rounding_cases::<LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>>("LooseQuadTree");
+}
+
+/// Worlds in which rounding around the node edges differs: origins at zero,
+/// below it, and off the node size, and sizes with and without an exact half.
+const NEAR_LIMIT_WORLDS: [Rectangle; 6] = [
+    Rectangle::new(-1000.0, -1000.0, 1000.0, 1000.0),
+    Rectangle::new(-1024.0, -1024.0, 1024.0, 1024.0),
+    Rectangle::new(-3.0, -3.0, 4.0, 4.0),
+    Rectangle::new(0.0, 0.0, 1024.0, 1024.0),
+    Rectangle::new(0.3, -0.7, 1000.1, 333.3),
+    Rectangle::new(-9440.5, -6455.8, 13520.7, 15000.1),
+];
+
+/// Spans `[low, high]` of at most `node`, within `floats` floats of the node
+/// size around edge `edge` of an axis.
+fn near_limit_spans(origin: f64, node: f64, edge: usize, floats: i32) -> Vec<[f64; 2]> {
+    let shifted = |value: f64, floats: i32| {
+        (0..floats.abs()).fold(value, |value, _| {
+            if floats > 0 { value.next_up() } else { value.next_down() }
+        })
+    };
+    let low = origin + node * (edge as f64 - 0.5);
+    let high = origin + node * (edge as f64 + 0.5);
+    let mut spans = Vec::new();
+    for low_floats in -floats..=floats {
+        for high_floats in -floats..=floats {
+            let span = [shifted(low, low_floats), shifted(high, high_floats)];
+            if span[1] - span[0] <= node {
+                spans.push(span);
+            }
+        }
+    }
+    spans
+}
+
+/// All the near-limit spans around the three inner edges of the level of 4 by 4
+/// nodes, along each axis in turn, against each other: the items and pairs that
+/// only a few spans of each edge in [`near_limit_items`] would miss. Items of
+/// the middle edge meet those of the outer ones, two nodes off, only by rounding,
+/// so searches with the one, not stored, must find the others, and vice versa.
+fn check_all_near_limit_spans<Tree: OverflowBounded + PairQuery>(name: &str) {
+    for world in NEAR_LIMIT_WORLDS {
+        for along_x in [true, false] {
+            let context = format!("{name}, world {world:?}, along x {along_x}");
+            let root = Tree::create(world.clone(), false).root();
+            let (middle_x, middle_y) = world.get_center();
+            let items: Vec<(usize, Rectangle)> = (1..4)
+                .flat_map(|edge| {
+                    let (origin, node) = if along_x {
+                        (root.min_x, root.get_width() / 4.0)
+                    } else {
+                        (root.min_y, root.get_height() / 4.0)
+                    };
+                    near_limit_spans(origin, node, edge, 8).into_iter().map(move |span| (edge, span))
+                })
+                .map(|(edge, [low, high])| {
+                    let bounds = if along_x {
+                        let half = root.get_height() / 64.0;
+                        Rectangle::new(low, middle_y - half, high, middle_y + half)
+                    } else {
+                        let half = root.get_width() / 64.0;
+                        Rectangle::new(middle_x - half, low, middle_x + half, high)
+                    };
+                    (edge, bounds)
+                })
+                .collect();
+
+            let mut tree = Tree::create(world.clone(), false);
+            let handles: Vec<Option<(ItemHandle, Rectangle)>> = items
+                .iter()
+                .enumerate()
+                .map(|(id, (_, bounds))| Some((tree.insert_item(bounds.clone(), id), bounds.clone())))
+                .collect();
+            tree.refresh();
+            assert_pairs_match_brute_force(&tree, &handles, &context);
+
+            for stored_edge_is_middle in [true, false] {
+                let (stored, queries): (Vec<_>, Vec<_>) = items
+                    .iter()
+                    .enumerate()
+                    .partition(|(_, (edge, _))| (*edge == 2) == stored_edge_is_middle);
+                let mut tree = Tree::create(world.clone(), false);
+                for &(id, (_, bounds)) in &stored {
+                    tree.insert_item(bounds.clone(), id);
+                }
+                tree.refresh();
+                for &(_, (_, query)) in &queries {
+                    let mut expected: Vec<usize> = stored
+                        .iter()
+                        .filter(|(_, (_, bounds))| bounds.intersects(query))
+                        .map(|&(id, _)| id)
+                        .collect();
+                    let mut found = Vec::new();
+                    tree.search_items(query, &mut |id| found.push(id));
+                    expected.sort_unstable();
+                    found.sort_unstable();
+                    assert_eq!(found, expected, "{context}: {query:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn all_near_limit_spans_are_found() {
+    macro_rules! hierarchical {
+        ($($tree:ident),*) => {$(
+            check_all_near_limit_spans::<$tree<usize, 3>>(concat!(stringify!($tree), ", MAX_LEVEL 3"));
+            check_all_near_limit_spans::<$tree<usize, MAX_LEVEL>>(stringify!($tree));
+        )*};
+    }
+    hierarchical!(
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
+        LazyOverflowBoundGrid,
+        SpanOverflowBoundGrid,
+        HaloOverflowBoundGrid,
+        HierarchicalLooseGrid
+    );
+    check_all_near_limit_spans::<Coarse<SpanGrid<usize>, 4>>("SpanGrid, 4 cells");
+    check_all_near_limit_spans::<Coarse<HaloGrid<usize>, 4>>("HaloGrid, 4 cells");
+    check_all_near_limit_spans::<UniformGrid<usize>>("UniformGrid");
+    check_all_near_limit_spans::<TwoLayerGrid<usize>>("TwoLayerGrid");
+    check_all_near_limit_spans::<MultiGrid<usize>>("MultiGrid");
+    check_all_near_limit_spans::<LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>>("LooseQuadTree");
+}
+
+/// Items of about the node size of each level, centered within a few floats
+/// of a node edge, along x and along y. Of the bounds that keep the size at
+/// or below the node's, each edge gets those going furthest either way, the
+/// ones most likely to pass the half node.
+fn near_limit_items(root: &Rectangle, world: &Rectangle) -> Vec<Rectangle> {
+    const KEPT: usize = 4;
+    let spans = |origin: f64, node: f64, edge: usize| {
+        let mut spans = near_limit_spans(origin, node, edge, 12);
+        let mut kept = Vec::new();
+        spans.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        kept.extend_from_slice(&spans[..KEPT.min(spans.len())]);
+        spans.sort_by(|a, b| b[1].total_cmp(&a[1]));
+        kept.extend_from_slice(&spans[..KEPT.min(spans.len())]);
+        kept
+    };
+    let (middle_x, middle_y) = world.get_center();
+    let mut items = Vec::new();
+    for level in 2..=MAX_LEVEL as u32 {
+        let cells = 1usize << (level - 1);
+        let node_width = root.get_width() / cells as f64;
+        let node_height = root.get_height() / cells as f64;
+        let mut edges: Vec<usize> =
+            [1, 2, 3, cells / 2, cells / 2 + 1, cells / 2 + 2, cells.wrapping_sub(2), cells - 1]
+                .into_iter()
+                .filter(|edge| (1..cells).contains(edge))
+                .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        for edge in edges {
+            for [min_x, max_x] in spans(root.min_x, node_width, edge) {
+                let half = node_height / 8.0;
+                items.push(Rectangle::new(min_x, middle_y - half, max_x, middle_y + half));
+            }
+            for [min_y, max_y] in spans(root.min_y, node_height, edge) {
+                let half = node_width / 8.0;
+                items.push(Rectangle::new(middle_x - half, min_y, middle_x + half, max_y));
+            }
+        }
+    }
+    items
+}
+
+/// Run `check` on the near-limit items of every world, stale and refreshed:
+/// inserted at once, and updated from bounds a quarter of their size off in
+/// either direction, which the update shortcut takes for the same node.
+fn check_near_limit_items<Tree: OverflowBounded>(
+    name: &str,
+    check: impl Fn(&Tree, &[Option<(ItemHandle, Rectangle)>], &str),
+) {
+    for (world, fit) in NEAR_LIMIT_WORLDS.into_iter().flat_map(|world| [(world.clone(), false), (world, true)]) {
+        let root = Tree::create(world.clone(), fit).root();
+        let bounds = near_limit_items(&root, &world);
+        for start in [None, Some(0.25), Some(-0.25)] {
+            let context = format!("{name}, world {world:?}, fit {fit}, from {start:?}");
+            let mut tree = Tree::create(world.clone(), fit);
+            let items: Vec<Option<(ItemHandle, Rectangle)>> = bounds
+                .iter()
+                .enumerate()
+                .map(|(id, bounds)| {
+                    let handle = match start {
+                        None => tree.insert_item(bounds.clone(), id),
+                        Some(offset) => {
+                            let (x, y) = bounds.get_center();
+                            let (width, height) = (bounds.get_width(), bounds.get_height());
+                            let handle = tree.insert_item(
+                                Rectangle::center_rect(
+                                    x + offset * width,
+                                    y + offset * height,
+                                    0.75 * width,
+                                    0.75 * height,
+                                ),
+                                id,
+                            );
+                            tree.update_item(bounds.clone(), handle);
+                            handle
+                        }
+                    };
+                    Some((handle, bounds.clone()))
+                })
+                .collect();
+            check(&tree, &items, &format!("{context}, stale"));
+            tree.refresh();
+            check(&tree, &items, &format!("{context}, refreshed"));
+        }
+    }
+}
+
+/// A search with bounds that are not stored finds what brute force finds. The
+/// stored half of the near-limit items may keep within their half nodes while
+/// the queries, the other half, do not.
+fn check_near_limit_queries<Tree: OverflowBounded>(name: &str) {
+    for (world, fit) in NEAR_LIMIT_WORLDS.into_iter().flat_map(|world| [(world.clone(), false), (world, true)]) {
+        let context = format!("{name}, world {world:?}, fit {fit}");
+        let mut tree = Tree::create(world.clone(), fit);
+        let bounds = near_limit_items(&tree.root(), &world);
+        let (stored, queries): (Vec<_>, Vec<_>) = bounds.iter().enumerate().partition(|(id, _)| id % 2 == 0);
+        for &(id, bounds) in &stored {
+            tree.insert_item(bounds.clone(), id);
+        }
+        tree.refresh();
+        for &(_, query) in &queries {
+            let mut expected: Vec<usize> = stored
+                .iter()
+                .filter(|(_, bounds)| bounds.intersects(query))
+                .map(|&(id, _)| id)
+                .collect();
+            let mut found = Vec::new();
+            tree.search_items(query, &mut |id| found.push(id));
+            expected.sort_unstable();
+            found.sort_unstable();
+            assert_eq!(found, expected, "{context}: {query:?}");
+        }
+    }
+}
+
+#[test]
+fn near_limit_items_are_found() {
+    macro_rules! all_checks {
+        ($name:expr, $tree:ty) => {
+            check_near_limit_items::<$tree>($name, assert_pairs_match_brute_force);
+            check_near_limit_items::<$tree>($name, assert_self_query_matches_brute_force);
+            check_near_limit_queries::<$tree>($name);
+        };
+    }
+    macro_rules! hierarchical {
+        ($($tree:ident),*) => {$(
+            all_checks!(concat!(stringify!($tree), ", MAX_LEVEL 2"), $tree<usize, 2>);
+            all_checks!(concat!(stringify!($tree), ", MAX_LEVEL 3"), $tree<usize, 3>);
+            all_checks!(stringify!($tree), $tree<usize, MAX_LEVEL>);
+        )*};
+    }
+    hierarchical!(
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
+        LazyOverflowBoundGrid,
+        SpanOverflowBoundGrid,
+        HaloOverflowBoundGrid,
+        HierarchicalLooseGrid
+    );
+    all_checks!("SpanGrid", SpanGrid<usize>);
+    all_checks!("HaloGrid", HaloGrid<usize>);
+    all_checks!("SpanGrid, 4 cells", Coarse<SpanGrid<usize>, 4>);
+    all_checks!("HaloGrid, 4 cells", Coarse<HaloGrid<usize>, 4>);
+    all_checks!("UniformGrid", UniformGrid<usize>);
+    all_checks!("TwoLayerGrid", TwoLayerGrid<usize>);
+    all_checks!("MultiGrid", MultiGrid<usize>);
+    let name = "LooseQuadTree";
+    check_near_limit_items::<LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>>(name, assert_pairs_match_brute_force);
+    check_near_limit_queries::<LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>>(name);
+}
+
+/// With two and three levels, the rounding of the near-limit items above is
+/// where the pair walk and the self query are most likely to lose an item.
+#[test]
+fn pairs_and_self_queries_with_few_levels() {
+    macro_rules! few_levels {
+        ($($tree:ident),*) => {$(
+            check_pairs::<$tree<usize, 2>>(concat!(stringify!($tree), ", MAX_LEVEL 2"));
+            check_pairs::<$tree<usize, 3>>(concat!(stringify!($tree), ", MAX_LEVEL 3"));
+            check_self_query::<$tree<usize, 2>>(concat!(stringify!($tree), ", MAX_LEVEL 2"));
+            check_self_query::<$tree<usize, 3>>(concat!(stringify!($tree), ", MAX_LEVEL 3"));
+        )*};
+    }
+    few_levels!(
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
+        LazyOverflowBoundGrid,
+        SpanOverflowBoundGrid,
+        HaloOverflowBoundGrid,
+        HierarchicalLooseGrid
+    );
 }
 
 /// Run `check` on a tree of every world of `SELF_QUERY_WORLDS`, unfitted and

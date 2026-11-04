@@ -1,19 +1,93 @@
 //! Per-level geometry of the grid-based structures: exact size limits and
-//! cell edges with which `update` confirms that an item stays in its cell
-//! without repeating the positioning arithmetic.
+//! cell ranges with which `update` confirms that an item stays in its cell
+//! without repeating the positioning arithmetic, and what keeps every item
+//! and query within the half node that the walks and scans count on.
+//!
+//! An item no larger than a node and centered in it reaches at most half a
+//! node past it, but only up to rounding: its width may round down to the node
+//! size and its center onto a node edge while its bounds go a few floats
+//! further. That takes it out of the 3x3 of a search and of the scan range of
+//! another level. Only what is within [`reach_margin`] of both limits can do
+//! so, a size within it of the node size and a center within it of a node
+//! edge, so everything else passes as before at no cost:
+//!
+//! - Positioning finds the level with [`sizing_root`], which leaves out sizes
+//!   within the margin of a level's limit. An item of such a size stays on
+//!   the level only if [`within_reach`] says so, and otherwise goes one level
+//!   up, where it is far below the limit.
+//! - A search finds its level the same way, so a query that does not stay
+//!   within reach starts one level up. Any coarser level gives the same
+//!   results: it scans the finer ones.
+//! - The update shortcut accepts only centers beyond the margin of a node
+//!   edge, and leaves the rest to positioning.
 
+use crate::overflow_bound::rounding_slack;
 use crate::rect::Rectangle;
 use grid::Grid;
+
+/// How far within a limit rounding could take an item past the half node, by
+/// a wide margin: four times [`rounding_slack`], of which the arithmetic needs
+/// about `2^-48` of the largest root coordinate; [`within_reach`] may add one
+/// slack for arithmetic it does not repeat.
+pub(crate) fn reach_margin(root_bounds: &Rectangle) -> f64 {
+    4.0 * rounding_slack(root_bounds)
+}
+
+/// Root size to give [`size_level`] for items and queries, for a finest level
+/// of `finest_cells` nodes per axis: smaller by the margin on each of them, so
+/// that a size it puts on a level is at least [`reach_margin`] below the node
+/// size there. In a world so far from the origin that this leaves nothing, all
+/// sizes come out on the root.
+pub(crate) fn sizing_root(root_bounds: &Rectangle, finest_cells: f64) -> (f64, f64) {
+    let shrink = reach_margin(root_bounds) * finest_cells;
+    (root_bounds.get_width() - shrink, root_bounds.get_height() - shrink)
+}
+
+/// Whether an item with `bounds` in node `(x, y)` of a level with these
+/// reciprocal node sizes stays, widened by `margin`, within reach of the walks
+/// and scans. With corners `f(v) = (v - origin) * 2 * inverse`, in half nodes,
+/// the conditions are `f(min) >= 2x - 1` and `f(max) < 2x + 3`, except for no
+/// lower one on the first node, and they do three things:
+///
+/// - The scans of [`scan_range`], [`first_reaching_node`] and
+///   [`last_reaching_node`] compute the same `f` and reach node `x` from a
+///   query ending at `f >= 2x - 1` or starting at `f <= 2x + 3`, and `f` only
+///   grows with its argument, so a query that meets the item reaches its node.
+/// - Two items two or more nodes apart cannot meet, nor can an item and a query
+///   within reach of the node they walk from: `f(max)` of the one is below
+///   `f(min)` of the other, so `max` is too. The lower limit may be met exactly
+///   so that an item of exactly the node size, centered exactly on a node edge,
+///   stays; the strict upper limit then decides.
+/// - On a coarser level `f` halves and the cell index halves, rounded down,
+///   so the conditions hold for the ancestors of the node too.
+///
+/// A `margin` covers the center lines of the 3x3 of the grids that compare with
+/// those, which come from yet other arithmetic.
+pub(crate) fn within_reach(
+    bounds: &Rectangle,
+    margin: f64,
+    origin: (f64, f64),
+    inverse: (f64, f64),
+    (x, y): (usize, usize),
+) -> bool {
+    let axis = |min: f64, max: f64, origin: f64, inverse: f64, node: usize| {
+        let half_nodes = 2.0 * inverse;
+        (node == 0 || (min - margin - origin) * half_nodes >= (2 * node - 1) as f64)
+            && (max + margin - origin) * half_nodes < (2 * node + 3) as f64
+    };
+    axis(bounds.min_x, bounds.max_x, origin.0, inverse.0, x)
+        && axis(bounds.min_y, bounds.max_y, origin.1, inverse.1, y)
+}
 
 /// Per-level constants derived from the root bounds, plus the number of
 /// objects currently stored on the level.
 ///
 /// Everything except `object_count` is fixed for the lifetime of the tree.
-/// The node size and cell edges agree bit for bit with the positioning
-/// arithmetic of the owning structure, such as
+/// The node size agrees bit for bit with the positioning arithmetic of the
+/// owning structure, such as
 /// [`HierarchicalLooseGrid::position`](crate::HierarchicalLooseGrid::position),
-/// so `update` can confirm that an item stays in its node without repeating
-/// that computation.
+/// and the cell ranges stay clear of its rounding, so `update` can confirm that
+/// an item stays in its node without repeating that computation.
 #[derive(Default)]
 pub(crate) struct LayerGeometry {
     // `search` reads only the first three fields of each level it visits.
@@ -30,33 +104,21 @@ pub(crate) struct LayerGeometry {
     /// slower.
     pub(crate) half_node_width: f64,
     pub(crate) half_node_height: f64,
-    /// Lower edge of every cell along each axis, relative to the root origin;
-    /// cell `i` covers the half-open interval `edges[i]..edges[i + 1]`. Empty
-    /// on the root and on degenerate levels, which disables the update
-    /// shortcut.
+    /// Centers relative to the root origin that the update shortcut accepts
+    /// for each cell along each axis: cell `i` takes the half-open interval
+    /// `ranges[2 * i]..ranges[2 * i + 1]`, its own without [`reach_margin`] at
+    /// both ends, except for the outer end of the first. Empty on the root and
+    /// on degenerate levels, which disables the update shortcut.
     ///
     /// Boxed slices keep the struct at 72 bytes; `Vec`s make it 88 bytes,
     /// which measured `search` a few percent slower.
-    pub(crate) cell_x_edges: Box<[f64]>,
-    pub(crate) cell_y_edges: Box<[f64]>,
+    pub(crate) cell_x_ranges: Box<[f64]>,
+    pub(crate) cell_y_ranges: Box<[f64]>,
 }
 
 impl LayerGeometry {
-    /// Geometry of `level`, whose grid has `cols` by `rows` cells, for a
-    /// structure whose `position` multiplies coordinates by these reciprocals
-    /// of the node size; the cell edges follow that arithmetic. `position`
-    /// must use the same reciprocals, or the update shortcut could keep an
-    /// item in a cell that `position` would not choose: multiplying by
-    /// another value, or dividing by the node size, can round across a cell
-    /// boundary.
-    pub(crate) fn with_reciprocal(
-        root_bounds: &Rectangle,
-        level: usize,
-        cols: usize,
-        rows: usize,
-        inverse_node_width: f64,
-        inverse_node_height: f64,
-    ) -> Self {
+    /// Geometry of `level`, whose grid has `cols` by `rows` cells.
+    pub(crate) fn new(root_bounds: &Rectangle, level: usize, cols: usize, rows: usize) -> Self {
         let root_width = root_bounds.get_width();
         let root_height = root_bounds.get_height();
         let (node_width, node_height) = Self::node_size(root_bounds, cols, rows);
@@ -76,18 +138,15 @@ impl LayerGeometry {
             };
         }
 
-        // A coordinate relative to the root origin maps to its cell exactly
-        // as in the structure's `position`.
-        let cell_of_x = |x: f64| (x * inverse_node_width) as usize;
-        let cell_of_y = |y: f64| (y * inverse_node_height) as usize;
+        let margin = reach_margin(root_bounds);
         Self {
             object_count: 0,
             node_width,
             node_height,
             half_node_width: node_width * 0.5,
             half_node_height: node_height * 0.5,
-            cell_x_edges: Self::cell_edges(node_width, cols, cell_of_x),
-            cell_y_edges: Self::cell_edges(node_height, rows, cell_of_y),
+            cell_x_ranges: Self::cell_ranges(node_width, cols, margin),
+            cell_y_ranges: Self::cell_ranges(node_height, rows, margin),
         }
     }
 
@@ -109,7 +168,7 @@ impl LayerGeometry {
     /// Whether `matches_layer` and `matches_cell` are usable on this level.
     #[inline]
     pub(crate) fn has_update_shortcut(&self) -> bool {
-        !self.cell_x_edges.is_empty()
+        !self.cell_x_ranges.is_empty()
     }
 
     #[inline]
@@ -117,14 +176,15 @@ impl LayerGeometry {
         self.object_count == 0
     }
 
-    /// Whether `position` assigns an object of this size to this level.
+    /// Whether an object of this size belongs on this level, as `position`
+    /// sees it for all but objects that rounding takes out of reach.
     ///
-    /// `position` assigns an object here when `(root / size) as usize` lies in
-    /// `2^(level - 1)..2^level`. Comparing with the node size reproduces this
-    /// exactly: `node_width` is `root / 2^(level - 1)` without rounding, so
-    /// dividing the root by it yields exactly `2^(level - 1)`, and dividing by
-    /// the next float above it yields less. The halved node size, also exact,
-    /// bounds the next finer level in the same way.
+    /// That is when `(root / size) as usize` lies in `2^(level - 1)..2^level`.
+    /// Comparing with the node size reproduces this exactly: `node_width` is
+    /// `root / 2^(level - 1)` without rounding, so dividing the root by it
+    /// yields exactly `2^(level - 1)`, and dividing by the next float above it
+    /// yields less. The halved node size, also exact, bounds the next finer
+    /// level in the same way.
     #[inline]
     pub(crate) fn matches_layer(&self, width: f64, height: f64, is_finest_layer: bool) -> bool {
         // Degenerate sizes fall through to full positioning.
@@ -140,35 +200,46 @@ impl LayerGeometry {
         is_finest_layer || width > self.half_node_width || height > self.half_node_height
     }
 
-    /// Whether `position` maps a center at this root-relative offset to `cell`.
+    /// Whether an object of at most this level's size limit, centered at this
+    /// root-relative offset, goes in `cell` and stays within reach: a center
+    /// beyond [`reach_margin`] of the cell's edges, where rounding can neither
+    /// move it across one nor take the object past the half node. A center
+    /// within the margin is left to `position`, however small the object.
     #[inline]
     pub(crate) fn matches_cell(&self, relative_center: (f64, f64), cell: (usize, usize)) -> bool {
         let (center_x, center_y) = relative_center;
         let (x, y) = cell;
-        (self.cell_x_edges[x]..self.cell_x_edges[x + 1]).contains(&center_x)
-            && (self.cell_y_edges[y]..self.cell_y_edges[y + 1]).contains(&center_y)
+        (self.cell_x_ranges[2 * x]..self.cell_x_ranges[2 * x + 1]).contains(&center_x)
+            && (self.cell_y_ranges[2 * y]..self.cell_y_ranges[2 * y + 1]).contains(&center_y)
     }
 
-    /// Lower edge of every cell as seen by `position`: `edges[i]` is the
-    /// smallest relative coordinate `c` with `cell_of(c) == i`.
-    ///
-    /// `cell_size * i` may land on either side of the cast boundary, so the
-    /// boundary is located by stepping through adjacent floats.
-    fn cell_edges(cell_size: f64, cell_count: usize, cell_of: impl Fn(f64) -> usize) -> Box<[f64]> {
-        let mut edges = Vec::with_capacity(cell_count + 1);
-        edges.push(f64::NEG_INFINITY); // Negative casts saturate to cell zero.
-        for index in 1..cell_count {
-            let mut edge = cell_size * index as f64;
-            while cell_of(edge) < index {
-                edge = edge.next_up();
-            }
-            while cell_of(edge.next_down()) >= index {
-                edge = edge.next_down();
-            }
-            edges.push(edge);
-        }
-        edges.push(f64::INFINITY); // The last cell clamps all larger coordinates.
-        edges.into_boxed_slice()
+    /// Whether an object of this size fits a node of this level, zero sizes
+    /// included and inverted ones not. Nearly always false, so all comparisons
+    /// are made up front: which axis fits varies from one object to the next,
+    /// and short-circuit branches on that measured queries of 400 to 1500 units
+    /// about 3% slower, with the code alignment forced.
+    #[inline]
+    pub(crate) fn fits_node(&self, width: f64, height: f64) -> bool {
+        (width <= self.node_width)
+            & (height <= self.node_height)
+            & (width >= 0.0)
+            & (height >= 0.0)
+    }
+
+    /// The ranges of [`cell_x_ranges`](Self::cell_x_ranges) along one axis. The
+    /// first cell has no lower limit: negative casts saturate to it, and it
+    /// has no neighbor on that side to overreach to.
+    fn cell_ranges(cell_size: f64, cell_count: usize, margin: f64) -> Box<[f64]> {
+        (0..cell_count)
+            .flat_map(|index| {
+                let low = if index == 0 {
+                    f64::NEG_INFINITY
+                } else {
+                    cell_size * index as f64 + margin
+                };
+                [low, cell_size * (index + 1) as f64 - margin]
+            })
+            .collect()
     }
 }
 
@@ -181,6 +252,8 @@ pub(crate) struct Levels<N> {
     /// Reciprocal of the node width and height of each level, which `position`
     /// multiplies by.
     pub(crate) inverse_node_size: Vec<(f64, f64)>,
+    /// Root size to find the level of an item or query from, by [`sizing_root`].
+    pub(crate) size_root: (f64, f64),
 }
 
 /// The levels of a multi-level grid over `world_bounds`, with nodes made by
@@ -237,23 +310,17 @@ pub(crate) fn build_levels<N, const FIT: bool>(
     for (level, grid) in layers.iter().enumerate().skip(1) {
         let (node_width, node_height) =
             LayerGeometry::node_size(&root_bounds, grid.cols(), grid.rows());
-        let inverse = (1.0 / node_width, 1.0 / node_height);
-        geometry.push(LayerGeometry::with_reciprocal(
-            &root_bounds,
-            level,
-            grid.cols(),
-            grid.rows(),
-            inverse.0,
-            inverse.1,
-        ));
-        inverse_node_size.push(inverse);
+        geometry.push(LayerGeometry::new(&root_bounds, level, grid.cols(), grid.rows()));
+        inverse_node_size.push((1.0 / node_width, 1.0 / node_height));
     }
+    let size_root = sizing_root(&root_bounds, n as f64);
 
     Levels {
         layers,
         root_bounds,
         geometry,
         inverse_node_size,
+        size_root,
     }
 }
 
@@ -325,12 +392,12 @@ pub(crate) fn half_node_corners(relative: [f64; 4], finest_inverse: (f64, f64)) 
 /// in nodes of that level these are `ceil(n - 1.5)` and `floor(n + 0.5)`:
 /// the nodes whose items reach the query, and also a node that the query
 /// starts exactly half a node past or ends exactly half a node before, as an
-/// item whose bounds round a float past that half node still meets such a
-/// query. The scan used to stop short of that node, at `round(n) - 1` and
-/// `ceil(n - 0.5)`. Rounding can take an item further past its half node,
-/// as when its width rounds to the node size, so a query that ends a float
-/// before that half node may still miss it. Both bounds follow by shifts
-/// alone: the reciprocal node sizes of the levels differ by exact powers of
+/// item may reach exactly there and still meet such a query through rounding
+/// of its corner. The scan used to stop short of that node, at `round(n) - 1`
+/// and `ceil(n - 0.5)`. An item stays within these bounds by [`within_reach`],
+/// which positioning checks, even where rounding takes its bounds past the
+/// half node, as when its width rounds to the node size. Both bounds follow by
+/// shifts alone: the reciprocal node sizes of the levels differ by exact powers of
 /// two, so `n` on that level is the finest-level value scaled by `2^-shift`
 /// without rounding, and floor and ceil of a quotient by a power of two
 /// follow from those of the dividend. Only a minimum beyond the last node

@@ -22,7 +22,9 @@
 
 use crate::cell_order::for_each_cell_in_morton_order;
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
-use crate::layer_geometry::{LayerGeometry, first_reaching_node, last_reaching_node};
+use crate::layer_geometry::{
+    LayerGeometry, first_reaching_node, last_reaching_node, reach_margin, within_reach,
+};
 use crate::node_marks::{BoxedNode, NodeMarks};
 use crate::overflow_bound::{higher, lower};
 use crate::rect::{EMPTY, NOWHERE, Rectangle};
@@ -35,9 +37,11 @@ pub struct SpanGrid<T: Copy> {
     cells: Grid<Node<T>>,
     geometry: LayerGeometry,
     /// Reciprocals of the cell width and height. Position and search multiply
-    /// by them instead of dividing by the cell size, and `geometry` builds its
-    /// cell edges with the same arithmetic.
+    /// by them instead of dividing by the cell size.
     inverse_node_size: (f64, f64),
+    /// Cell size less the margin of [`reach_margin`]: an item or query no larger
+    /// stays within half a cell of its cell whatever the rounding of its bounds.
+    size_limit: (f64, f64),
     lines: LineSpan,
     /// Items larger than a cell, degenerate or centered outside the world.
     overflow: Node<T>,
@@ -69,18 +73,13 @@ impl<T: Copy> SpanGrid<T> {
         }
         let (node_width, node_height) = LayerGeometry::node_size(&root_bounds, cols, rows);
         let inverse_node_size = (1.0 / node_width, 1.0 / node_height);
+        let margin = reach_margin(&root_bounds);
         Self {
             cells: Grid::from_vec(nodes, cols),
             // Level 2, as every level but the root gets the update shortcut.
-            geometry: LayerGeometry::with_reciprocal(
-                &root_bounds,
-                2,
-                cols,
-                rows,
-                inverse_node_size.0,
-                inverse_node_size.1,
-            ),
+            geometry: LayerGeometry::new(&root_bounds, 2, cols, rows),
             inverse_node_size,
+            size_limit: (node_width - margin, node_height - margin),
             lines: LineSpan::new(cols, rows),
             overflow: Node::new(),
             overflow_touched: false,
@@ -101,11 +100,32 @@ impl<T: Copy> SpanGrid<T> {
         (self.geometry.node_width, self.geometry.node_height)
     }
 
-    /// Whether an item of this size belongs in a cell, not the overflow node.
+    /// Whether an item of this size belongs in a cell, not the overflow node,
+    /// unless rounding takes it out of reach of the scans.
     #[inline]
     fn fits_cell(&self, bounds: &Rectangle) -> bool {
         self.geometry
             .matches_layer(bounds.get_width(), bounds.get_height(), true)
+    }
+
+    /// Whether a query of this size can read its cell and the neighbors: below
+    /// [`size_limit`](Self::size_limit), or within reach despite its size, so
+    /// that it cannot meet an item two cells off. A larger one, or a degenerate
+    /// one, gives the same results from the scan.
+    #[inline]
+    fn fits_walk(&self, bounds: &Rectangle) -> bool {
+        let (width, height) = (bounds.get_width(), bounds.get_height());
+        (width > 0.0 && height > 0.0 && width <= self.size_limit.0 && height <= self.size_limit.1)
+            || self.fits_walk_past_limit(bounds)
+    }
+
+    /// [`fits_walk`](Self::fits_walk) of a query above the limit, kept out of
+    /// `search`, as few queries lie within the margin of the cell size and those
+    /// above it go on to the scan.
+    #[cold]
+    #[inline(never)]
+    fn fits_walk_past_limit(&self, bounds: &Rectangle) -> bool {
+        self.fits_cell(bounds) && !self.out_of_reach(bounds, self.cell_containing(bounds.get_center()))
     }
 
     /// Cell whose area contains `point`, clamped into the grid.
@@ -124,7 +144,20 @@ impl<T: Copy> SpanGrid<T> {
             return (OVERFLOW, 0, 0);
         }
         let (x, y) = self.cell_containing(center);
+        if (bounds.get_width() > self.size_limit.0 || bounds.get_height() > self.size_limit.1)
+            && self.out_of_reach(bounds, (x, y))
+        {
+            return (OVERFLOW, 0, 0);
+        }
         (1, x, y)
+    }
+
+    /// Whether an item or query within the margin of the cell size, which
+    /// rounding may take past the half cell, cannot count on cell `(x, y)`.
+    #[cold]
+    #[inline(never)]
+    fn out_of_reach(&self, bounds: &Rectangle, cell: (usize, usize)) -> bool {
+        !within_reach(bounds, 0.0, self.root_bounds.get_min(), self.inverse_node_size, cell)
     }
 
     /// Cheap check that `position` would still return `(level, x, y)` for
@@ -341,10 +374,7 @@ impl<T: Copy> SpanGrid<T> {
     /// results come from the walk of [`for_each_pair`](Self::for_each_pair),
     /// each pair in both orders, so a result between a cell item and an item of
     /// the overflow node is found by the overflow item's scan of the cells; the
-    /// results of one query are not reported together. A pair that rounding
-    /// hides from that scan (see [`for_each_pair`](Self::for_each_pair)) is
-    /// missing in both orders, where searching item by item misses it only from
-    /// the other side. The walk visits every cell, so where cells far outnumber
+    /// results of one query are not reported together. The walk visits every cell, so where cells far outnumber
     /// items, searching item by item is faster. On the search bench's
     /// distribution with 312.5-unit cells, whose largest balls overflow, the
     /// `self_query` bench group measured 0.39 ms, against 2.44 ms for the
@@ -365,11 +395,6 @@ impl<T: Copy> SpanGrid<T> {
     /// item is found once, by the overflow item, and no cell item reads the
     /// overflow node. The cells are visited in Morton order, the overflow node
     /// last.
-    ///
-    /// Like the scan of a search, which it copies, the scan of an overflow item
-    /// misses a cell item that rounding takes a float past the half cell that
-    /// cell items reach, as when its width rounds to the cell size and its
-    /// center to a cell edge; such a pair is not reported.
     ///
     /// Letting each cell item read the overflow node instead, as a search does,
     /// took 2.10 ms against 0.41 ms on the mixed distribution with 312.5-unit
@@ -426,7 +451,7 @@ impl<T: Copy> SpanGrid<T> {
         if bounds.has_nan() {
             return;
         }
-        if self.fits_cell(bounds) {
+        if self.fits_walk(bounds) {
             self.search_3x3(bounds, &mut callback);
         } else {
             self.scan(bounds, &mut callback);

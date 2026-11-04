@@ -1,4 +1,5 @@
 use crate::handle::{Entry, ItemHandle, NodeLocation, Slots};
+use crate::overflow_bound::rounding_slack;
 use crate::rect::Rectangle;
 
 use std::ptr;
@@ -260,6 +261,18 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         entry
     }
 
+    /// The rounding margin of the whole tree: the ancestors' coordinates, from
+    /// which this node's bounds follow, may be far larger than its own.
+    fn rounding_margin(&self) -> f64 {
+        let mut node = self;
+        while !node.parent.is_null() {
+            // SAFETY: a node's parent owns it, so it lives as long as the node,
+            // and nothing writes to it during this read.
+            node = unsafe { &*node.parent };
+        }
+        rounding_slack(&node.loose_bounds)
+    }
+
     fn split(&mut self, slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>) {
         if self.children.is_some() || self.items.len() <= MAX_ITEMS || self.level >= MAX_LEVEL {
             return;
@@ -270,6 +283,10 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         let height = self.loose_bounds.get_height() / 2.0;
         let offset_x = width / 4.0;
         let offset_y = height / 4.0;
+        // Rounding of the bounds below and of an item's center and size can
+        // take the item a few floats past its node's loose bounds, which search
+        // compares it with, so a child's reach past the items it can hold.
+        let margin = 2.0 * self.rounding_margin();
 
         let children = [0, 1, 2, 3].map(|i| {
             #[rustfmt::skip]
@@ -279,8 +296,8 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
             self.create_child(Rectangle::center_rect(
                 center_x + sign_x * offset_x,
                 center_y + sign_y * offset_y,
-                width,
-                height,
+                width + margin,
+                height + margin,
             ))
         });
 

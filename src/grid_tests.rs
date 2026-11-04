@@ -56,7 +56,9 @@ macro_rules! exact_reach_tests {
         fn random_bounds(rng: &mut StdRng, tree: &Tree) -> Rectangle {
             let root = tree.get_bounds();
             let world = &tree.world_bounds;
-            let geometry = &tree.geometry[rng.gen_range(1..=MAX_LEVEL as usize)];
+            let level = rng.gen_range(1..=MAX_LEVEL as usize);
+            let geometry = &tree.geometry[level];
+            let grid = &tree.layers[level];
 
             // The node size is the size limit of the level; half of it is that of
             // the next finer level.
@@ -72,17 +74,12 @@ macro_rules! exact_reach_tests {
             let width = near_one_of(rng, &width_limits, 0.0..root.get_width() * 1.1);
             let height = near_one_of(rng, &height_limits, 0.0..root.get_height() * 1.1);
 
-            // Only the inner edges are finite; the outer ones are +-infinity.
-            let inner_edges = |edges: &[f64], origin: f64| -> Vec<f64> {
-                edges
-                    .get(1..edges.len().saturating_sub(1))
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|edge| origin + edge)
-                    .collect()
+            // The edges between the cells; the root has none.
+            let inner_edges = |cells: usize, origin: f64, node_size: f64| -> Vec<f64> {
+                (1..cells).map(|index| origin + node_size * index as f64).collect()
             };
-            let x_edges = inner_edges(&geometry.cell_x_edges, root.min_x);
-            let y_edges = inner_edges(&geometry.cell_y_edges, root.min_y);
+            let x_edges = inner_edges(grid.cols(), root.min_x, geometry.node_width);
+            let y_edges = inner_edges(grid.rows(), root.min_y, geometry.node_height);
             let pad_x = world.get_width() * 0.05;
             let pad_y = world.get_height() * 0.05;
             let center_x = near_one_of(rng, &x_edges, world.min_x - pad_x..world.max_x + pad_x);
@@ -91,20 +88,38 @@ macro_rules! exact_reach_tests {
             Rectangle::center_rect(center_x, center_y, width, height)
         }
 
-        /// The update shortcut must agree with `position` exactly. A false positive
-        /// would leave an item in the wrong node; a false negative would only cost
-        /// time, but the cached limits are meant to be exact.
+        /// The update shortcut must agree with `position` away from the cell edges.
+        /// A false positive would leave an item in the wrong node; a false negative
+        /// would only cost time, and only a center near an edge may take that time.
         #[test]
         fn update_shortcut_agrees_with_position() {
             let mut rng = StdRng::seed_from_u64(0);
             for tree in trees() {
+                let margin = $crate::layer_geometry::reach_margin(&tree.root_bounds);
+                // Well clear of the edges, which the shortcut leaves to `position`.
+                let clear = |center: f64, origin: f64, node: f64| {
+                    let offset = (center - origin) / node;
+                    (offset - offset.round()).abs() * node > 2.0 * margin
+                };
                 for _ in 0..100_000 {
                     let bounds = random_bounds(&mut rng, &tree);
                     let coord @ (level, x, y) = tree.position(&bounds);
 
                     // Degenerate sizes intentionally bypass the shortcut.
                     let is_degenerate = bounds.get_width() <= 0.0 || bounds.get_height() <= 0.0;
-                    if tree.geometry[level].has_update_shortcut() && !is_degenerate {
+                    let geometry = &tree.geometry[level];
+                    let (center_x, center_y) = bounds.get_center();
+                    let origin = tree.root_bounds.get_min();
+                    if geometry.has_update_shortcut()
+                        && !is_degenerate
+                        && clear(center_x, origin.0, geometry.node_width)
+                        && clear(center_y, origin.1, geometry.node_height)
+                        && geometry.matches_layer(
+                            bounds.get_width(),
+                            bounds.get_height(),
+                            level == MAX_LEVEL as usize,
+                        )
+                    {
                         assert!(
                             tree.stays_in_node(&bounds, coord),
                             "false negative for {bounds:?} at {coord:?}"
@@ -197,12 +212,11 @@ macro_rules! refreshed_tests {
     () => {
         $crate::grid_tests::coarsest_occupied!();
 
-        /// The update shortcut must place a center in the same cell as
-        /// `position`, also within a few floats of every cell edge, where
-        /// multiplying by the reciprocal of the node size and dividing by it can
-        /// round to different cells.
+        /// Within a few floats of a cell edge, where rounding can put a center
+        /// in either cell and take an item past its half node, the update
+        /// shortcut must accept neither cell and leave the item to `position`.
         #[test]
-        fn update_shortcut_agrees_with_position_at_cell_edges() {
+        fn update_shortcut_leaves_cell_edges_to_position() {
             for world in WORLDS {
                 for tree in [Tree::new(world.clone()), Tree::new_fit(world.clone())] {
                     let origin = tree.root_bounds.get_min();
@@ -233,12 +247,23 @@ macro_rules! refreshed_tests {
                             }
                         }
                         for center in centers {
-                            let cell = tree.cell_containing(level, center);
+                            let (x, y) = tree.cell_containing(level, center);
                             let relative = (center.0 - origin.0, center.1 - origin.1);
-                            assert!(
-                                geometry.matches_cell(relative, cell),
-                                "world {world:?}, level {level}, center {center:?}, cell {cell:?}"
-                            );
+                            // Neither the cell `position` chooses nor the one
+                            // across the edge: rounding could take either wrong.
+                            for dy in 0..2 {
+                                for dx in 0..2 {
+                                    for cell in [
+                                        (x.saturating_sub(dx), y.saturating_sub(dy)),
+                                        ((x + dx).min(grid.cols() - 1), (y + dy).min(grid.rows() - 1)),
+                                    ] {
+                                        assert!(
+                                            !geometry.matches_cell(relative, cell),
+                                            "world {world:?}, level {level}, center {center:?}, cell {cell:?}"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -899,12 +924,11 @@ pub(crate) use span_tests;
 /// Tests of the single-level grids `SpanGrid` and `HaloGrid`.
 macro_rules! single_level_tests {
     () => {
-        /// The update shortcut must place a center in the same cell as
-        /// `position`, also within a few floats of every cell edge, where
-        /// multiplying by the reciprocal of the cell size and dividing by it can
-        /// round to different cells.
+        /// Within a few floats of a cell edge, where rounding can put a center
+        /// in either cell and take an item past its half cell, the update
+        /// shortcut must accept neither cell and leave the item to `position`.
         #[test]
-        fn update_shortcut_agrees_with_position_at_cell_edges() {
+        fn update_shortcut_leaves_cell_edges_to_position() {
             for world in WORLDS {
                 for cell in [64.0, 312.5, 77.7] {
                     let tree = Tree::new(world.clone(), cell);
@@ -933,12 +957,23 @@ macro_rules! single_level_tests {
                         }
                     }
                     for center in centers {
-                        let cell = tree.cell_containing(center);
+                        let (x, y) = tree.cell_containing(center);
                         let relative = (center.0 - origin.0, center.1 - origin.1);
-                        assert!(
-                            tree.geometry.matches_cell(relative, cell),
-                            "world {world:?}, cell size {cell_width}, center {center:?}, cell {cell:?}"
-                        );
+                        // Neither the cell `position` chooses nor the one across
+                        // the edge: rounding could take either wrong.
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                for cell in [
+                                    (x.saturating_sub(dx), y.saturating_sub(dy)),
+                                    ((x + dx).min(tree.cells.cols() - 1), (y + dy).min(tree.cells.rows() - 1)),
+                                ] {
+                                    assert!(
+                                        !tree.geometry.matches_cell(relative, cell),
+                                        "world {world:?}, cell size {cell_width}, center {center:?}, cell {cell:?}"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }

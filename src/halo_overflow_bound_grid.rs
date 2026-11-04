@@ -1,7 +1,7 @@
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::cell_order::for_each_cell_hierarchically;
 use crate::layer_geometry::{
-    LayerGeometry, Levels, build_levels, half_node_corners, scan_range, size_level,
+    LayerGeometry, Levels, build_levels, half_node_corners, scan_range, size_level, within_reach,
 };
 use crate::exact_overflow_bound_grid::DirectionalOverflow;
 use crate::node_marks::{BoxedNode, NodeMarks};
@@ -66,6 +66,9 @@ pub struct HaloOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
     /// and search multiply by them instead of dividing by the node size, and
     /// `geometry` builds its cell edges with the same arithmetic.
     inverse_node_size: Vec<(f64, f64)>,
+    /// Root size that the level of an item or query follows from, by
+    /// [`sizing_root`](crate::layer_geometry::sizing_root).
+    size_root: (f64, f64),
     /// Indexed by level, parallel to `layers`.
     lines: Vec<LineSpan>,
     /// Indexed by level, parallel to `layers`.
@@ -111,6 +114,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             root_bounds,
             geometry,
             inverse_node_size,
+            size_root,
         } = build_levels::<_, FIT>(&world_bounds, MAX_LEVEL, HaloOverflowBoundGridNode::new);
 
         // The root's spans grow like those of every level but are never read:
@@ -130,6 +134,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             layers,
             geometry,
             inverse_node_size,
+            size_root,
             lines,
             marks,
             halo,
@@ -285,7 +290,29 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             return (1, 0, 0);
         }
 
-        let level = self.level_for_size(bounds.get_width(), bounds.get_height());
+        let (width, height) = (bounds.get_width(), bounds.get_height());
+        let level = self.level_for_size(width, height);
+        // A size that `level_for_size` left out of the next finer level though
+        // it fits a node there lies within the margin of that level's limit.
+        if level < MAX_LEVEL as usize && self.geometry[level + 1].fits_node(width, height) {
+            return self.position_near_limit(bounds, center, level);
+        }
+        let (x, y) = self.cell_containing(level, center);
+        (level, x, y)
+    }
+
+    /// [`position`](Self::position) of an item within the margin of the size
+    /// limit of the level finer than `level`: on that level if it stays within
+    /// reach there, otherwise on `level`, far below the limit.
+    #[cold]
+    #[inline(never)]
+    fn position_near_limit(&self, bounds: &Rectangle, center: (f64, f64), level: usize) -> Coord {
+        let finer = level + 1;
+        let (x, y) = self.cell_containing(finer, center);
+        let origin = self.root_bounds.get_min();
+        if within_reach(bounds, 0.0, origin, self.inverse_node_size[finer], (x, y)) {
+            return (finer, x, y);
+        }
         let (x, y) = self.cell_containing(level, center);
         (level, x, y)
     }
@@ -298,9 +325,36 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
     fn level_for_size(&self, width: f64, height: f64) -> usize {
         // The bit length of `(root / size) as usize` on each axis, from the
         // exponents rather than by dividing.
-        let level_x = size_level(self.root_bounds.get_width(), width);
-        let level_y = size_level(self.root_bounds.get_height(), height);
+        let level_x = size_level(self.size_root.0, width);
+        let level_y = size_level(self.size_root.1, height);
         level_x.min(level_y).clamp(1, MAX_LEVEL as i64) as usize
+    }
+
+    /// Level to search from: that of the query's size, or, if that lies within
+    /// the margin of the limit of the next finer level, that finer level if the
+    /// query stays within reach there, so that a query of exactly the node size
+    /// keeps its ancestor walk.
+    #[inline]
+    fn query_level(&self, bounds: &Rectangle) -> usize {
+        let (width, height) = (bounds.get_width(), bounds.get_height());
+        let level = self.level_for_size(width, height);
+        if level < MAX_LEVEL as usize && self.geometry[level + 1].fits_node(width, height) {
+            return self.query_level_near_limit(bounds, level);
+        }
+        level
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn query_level_near_limit(&self, bounds: &Rectangle, level: usize) -> usize {
+        let finer = level + 1;
+        let cell = self.cell_containing(finer, bounds.get_center());
+        let origin = self.root_bounds.get_min();
+        if within_reach(bounds, 0.0, origin, self.inverse_node_size[finer], cell) {
+            finer
+        } else {
+            level
+        }
     }
 
     /// Cell of `level` whose area contains `point`, clamped into the grid.
@@ -449,7 +503,8 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
     /// `bounds`.
     ///
     /// [`LayerGeometry::matches_layer`] and [`LayerGeometry::matches_cell`]
-    /// explain why the cached limits agree with `position` exactly.
+    /// explain why `position` returns `coord` when this holds. A center near a
+    /// cell edge is left to `position`, even if it would return `coord`.
     fn stays_in_node(&self, bounds: &Rectangle, coord: Coord) -> bool {
         let (level, x, y) = coord;
         let geometry = &self.geometry[level];
@@ -472,10 +527,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
     /// results come from the walk of [`for_each_pair`](Self::for_each_pair),
     /// each pair in both orders, so a result across levels is found by the
     /// coarser item's scan of the finer levels and no item walks up to the
-    /// coarser ones; the results of one query are not reported together. A pair
-    /// that rounding hides from that scan (see
-    /// [`for_each_pair`](Self::for_each_pair)) is missing in both orders, where
-    /// searching item by item misses it only from the other side. The walk
+    /// coarser ones; the results of one query are not reported together. The walk
     /// visits every cell down to the finest level that holds items, so where
     /// cells far outnumber items, searching item by item is faster. On the
     /// search bench's distribution, the `self_query` bench group measured 0.27
@@ -497,11 +549,6 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
     /// through the levels and in Morton order within each, so that
     /// consecutive items read nearby cells, down to the finest level that
     /// holds items.
-    ///
-    /// Like the scan of a search, which it copies, the scan of the finer levels
-    /// misses an item that rounding takes a float past the half node that its
-    /// level's items reach, as when its width rounds to the node size and its
-    /// center to a node edge; such a pair is not reported.
     ///
     /// Leaving each cross-level pair to its finer item instead, which walked
     /// the ancestor path as a search does, took 0.56 ms against 0.28 ms on the
@@ -570,7 +617,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             return;
         }
         let max_level = MAX_LEVEL as usize;
-        let level = self.level_for_size(bounds.get_width(), bounds.get_height());
+        let level = self.query_level(bounds);
         let (offset_x, offset_y) = self.root_bounds.get_min();
 
         let layers = &self.layers;

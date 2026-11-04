@@ -2,11 +2,10 @@
 //! [`LazyOverflowBoundGrid`], [`SpanOverflowBoundGrid`] and the other
 //! overflow-bound grids.
 //!
-//! Positioning by size keeps every item within half a node of its cell, up
-//! to floating-point rounding, and the hierarchical loose grid always scans
-//! that far, with no margin for that rounding. Search needs only an
-//! upper bound on the actual distances to scan less, so the lazy grids do not
-//! track them exactly.
+//! Positioning by size keeps every item within half a node of its cell, as
+//! the scans compute that reach, and the hierarchical loose grid always scans
+//! that far, with no margin. Search needs only an upper bound on the actual
+//! distances to scan less, so the lazy grids do not track them exactly.
 //!
 //! Every array here lists the directions as left (-x), right (+x), top (-y)
 //! and bottom (+y).
