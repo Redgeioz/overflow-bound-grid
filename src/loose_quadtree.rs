@@ -204,7 +204,8 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
         let mut sizes = Vec::new();
         self.root.pair_subtree_sizes(&mut sizes);
         let mut next = 0;
-        self.root.pair_items(&self.root, &sizes, &mut next, &mut callback);
+        self.root
+            .pair_items(&self.root, &sizes, &mut next, &mut callback);
     }
 }
 

@@ -1,9 +1,30 @@
 //! Constants and the common interface of the structures, shared by the
 //! benchmarks.
 
+use std::time::Duration;
+
+use criterion::Criterion;
 use lib::external::*;
 use lib::rect::*;
 use lib::*;
+
+/// Criterion's settings for these benchmarks: about 1.5 s per id instead of
+/// 20 s on a pinned core, most of which went to plots and resampling. Against
+/// the defaults the medians of 17 ids differ by 0.1% at the median and at most
+/// 2%, with the same spread between runs
+/// (`bench-results/baseline-2026-11-04.md`). The noise of a benchmark lies
+/// between processes, so another round says more than a longer one. Arguments
+/// such as `--measurement-time` and `--sample-size` override these; the groups
+/// of the large scenes set their own sample sizes.
+#[allow(dead_code, reason = "unused by the frame benchmark")]
+pub fn criterion_config() -> Criterion {
+    Criterion::default()
+        .warm_up_time(Duration::from_millis(300))
+        .measurement_time(Duration::from_secs(1))
+        .sample_size(50)
+        .nresamples(10_000)
+        .without_plots()
+}
 
 pub const MAX_LEVEL: u8 = 7;
 pub const MAX_ITEMS: usize = 8;

@@ -61,7 +61,10 @@ pub struct SpanGrid<T: Copy> {
 impl<T: Copy> SpanGrid<T> {
     /// Create a grid of cells of about `cell_size` covering `world_bounds`.
     pub fn new(world_bounds: Rectangle, cell_size: f64) -> Self {
-        assert!(cell_size > 0.0 && cell_size.is_finite(), "invalid cell size");
+        assert!(
+            cell_size > 0.0 && cell_size.is_finite(),
+            "invalid cell size"
+        );
         let cols = (world_bounds.get_width() / cell_size).ceil().max(1.0) as usize;
         let rows = (world_bounds.get_height() / cell_size).ceil().max(1.0) as usize;
         let side = cols.max(rows) as f64 * cell_size;
@@ -125,15 +128,18 @@ impl<T: Copy> SpanGrid<T> {
     #[cold]
     #[inline(never)]
     fn fits_walk_past_limit(&self, bounds: &Rectangle) -> bool {
-        self.fits_cell(bounds) && !self.out_of_reach(bounds, self.cell_containing(bounds.get_center()))
+        self.fits_cell(bounds)
+            && !self.out_of_reach(bounds, self.cell_containing(bounds.get_center()))
     }
 
     /// Cell whose area contains `point`, clamped into the grid.
     #[inline]
     fn cell_containing(&self, point: (f64, f64)) -> (usize, usize) {
         let (origin_x, origin_y) = self.root_bounds.get_min();
-        let x = (((point.0 - origin_x) * self.inverse_node_size.0) as usize).min(self.cells.cols() - 1);
-        let y = (((point.1 - origin_y) * self.inverse_node_size.1) as usize).min(self.cells.rows() - 1);
+        let x =
+            (((point.0 - origin_x) * self.inverse_node_size.0) as usize).min(self.cells.cols() - 1);
+        let y =
+            (((point.1 - origin_y) * self.inverse_node_size.1) as usize).min(self.cells.rows() - 1);
         (x, y)
     }
 
@@ -157,7 +163,13 @@ impl<T: Copy> SpanGrid<T> {
     #[cold]
     #[inline(never)]
     fn out_of_reach(&self, bounds: &Rectangle, cell: (usize, usize)) -> bool {
-        !within_reach(bounds, 0.0, self.root_bounds.get_min(), self.inverse_node_size, cell)
+        !within_reach(
+            bounds,
+            0.0,
+            self.root_bounds.get_min(),
+            self.inverse_node_size,
+            cell,
+        )
     }
 
     /// Cheap check that `position` would still return `(level, x, y)` for
@@ -238,6 +250,10 @@ impl<T: Copy> SpanGrid<T> {
 
     /// Update the bounds of an item and, if necessary, its node.
     ///
+    /// Call it only for items that moved or changed size. It does not compare
+    /// the bounds with the old ones, so an unchanged item still marks its node
+    /// and the next [`refresh_bounds`](Self::refresh_bounds) redoes that node.
+    ///
     /// Panics if the handle has already been removed.
     pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
         let location = self.slots.get(handle);
@@ -315,10 +331,10 @@ impl<T: Copy> SpanGrid<T> {
     /// may keep either sign, which no comparison tells apart).
     ///
     /// Where at most half the cells are marked, only the marked cells are
-    /// visited, after reading every mark, and a column or row span is rebuilt
+    /// visited, after reading the marks of the touched rows, and a column or row span is rebuilt
     /// only if a marked cell held one of its ends and no longer reaches it,
-    /// or a cell in it emptied. Otherwise the boxes of the touched rows
-    /// shrink and the spans of those rows and of every column are rebuilt.
+    /// or a cell in it emptied. Otherwise the boxes of the marked cells
+    /// shrink and the spans of the touched rows and of every column are rebuilt.
     pub fn refresh_bounds(&mut self) {
         self.refresh_with(NodeMarks::is_sparse);
     }
@@ -336,14 +352,18 @@ impl<T: Copy> SpanGrid<T> {
         let lines = &mut self.lines;
         let cells = &mut self.cells;
         let marks = &mut self.marks;
-        if sparse(marks.count(), marks.occupied(), cells.cols() * cells.rows()) {
+        if sparse(
+            marks.count(&lines.row_touched),
+            marks.occupied(),
+            cells.cols() * cells.rows(),
+        ) {
             let LineSpan {
                 columns,
                 rows,
                 row_touched,
                 ..
             } = lines;
-            marks.refresh(cells, columns, rows, |_, _| {});
+            marks.refresh(cells, columns, rows, row_touched, |_, _| {});
             row_touched.fill(false);
             return;
         }
@@ -351,7 +371,20 @@ impl<T: Copy> SpanGrid<T> {
         for y in 0..cells.rows() {
             if std::mem::take(&mut lines.row_touched[y]) {
                 lines.rows[y] = NOWHERE;
+                let row_marks = marks.row_ptr(y);
                 for (x, node) in cells[y].iter_mut().enumerate() {
+                    // SAFETY: `x` is a column of row `y`, and the sweep stores
+                    // no marks.
+                    if unsafe { *row_marks.add(x) } == 0 {
+                        // The box still equals what the items give, since
+                        // every store and take marks. A path of its own, so
+                        // that the shrink below keeps the new box in registers
+                        // for the widening.
+                        if !node.items.is_empty() {
+                            lines.widen((x, y), &node.bounds);
+                        }
+                        continue;
+                    }
                     node.refresh();
                     if !node.items.is_empty() {
                         lines.widen((x, y), &node.bounds);
@@ -437,7 +470,8 @@ impl<T: Copy> SpanGrid<T> {
                     callback(found, entry.item);
                 }
             };
-            self.overflow.pair_with_after(index, &entry.bounds, &mut report);
+            self.overflow
+                .pair_with_after(index, &entry.bounds, &mut report);
             self.pair_scan(&entry.bounds, &mut report);
         }
     }
@@ -483,7 +517,8 @@ impl<T: Copy> SpanGrid<T> {
             let down = (y + 1 != rows) & (bounds.max_y > below);
             let before = (x != 0) & (bounds.min_x < left_of);
             let after = (x + 1 != cols) & (bounds.max_x > right_of);
-            grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+            grid.get_unchecked(y, x)
+                .pair_with_after(start, bounds, callback);
             if after {
                 grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
             }
@@ -521,11 +556,13 @@ impl<T: Copy> SpanGrid<T> {
 
             if up {
                 if before {
-                    grid.get_unchecked(y - 1, x - 1).search_items(bounds, callback);
+                    grid.get_unchecked(y - 1, x - 1)
+                        .search_items(bounds, callback);
                 }
                 grid.get_unchecked(y - 1, x).search_items(bounds, callback);
                 if after {
-                    grid.get_unchecked(y - 1, x + 1).search_items(bounds, callback);
+                    grid.get_unchecked(y - 1, x + 1)
+                        .search_items(bounds, callback);
                 }
             }
             if before {
@@ -537,11 +574,13 @@ impl<T: Copy> SpanGrid<T> {
             }
             if down {
                 if before {
-                    grid.get_unchecked(y + 1, x - 1).search_items(bounds, callback);
+                    grid.get_unchecked(y + 1, x - 1)
+                        .search_items(bounds, callback);
                 }
                 grid.get_unchecked(y + 1, x).search_items(bounds, callback);
                 if after {
-                    grid.get_unchecked(y + 1, x + 1).search_items(bounds, callback);
+                    grid.get_unchecked(y + 1, x + 1)
+                        .search_items(bounds, callback);
                 }
             }
         }

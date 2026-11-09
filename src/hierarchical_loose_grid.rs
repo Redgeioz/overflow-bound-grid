@@ -112,7 +112,13 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
         let finer = level + 1;
         let (x, y) = self.cell_containing(finer, center);
         let origin = self.root_bounds.get_min();
-        if within_reach(bounds, rounding_slack(&self.root_bounds), origin, self.inverse_node_size[finer], (x, y)) {
+        if within_reach(
+            bounds,
+            rounding_slack(&self.root_bounds),
+            origin,
+            self.inverse_node_size[finer],
+            (x, y),
+        ) {
             return (finer, x, y);
         }
         let (x, y) = self.cell_containing(level, center);
@@ -340,8 +346,9 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
     fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let layers = &self.layers;
         // Levels finer than the finest one holding items need no visit.
-        let Some(finest) =
-            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        let Some(finest) = (1..=MAX_LEVEL as usize)
+            .rev()
+            .find(|&level| !self.geometry[level].is_empty())
         else {
             return;
         };
@@ -360,7 +367,8 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
                         }
                     };
                     if level == 1 {
-                        self.get_root().pair_with_after(index, &entry.bounds, &mut report);
+                        self.get_root()
+                            .pair_with_after(index, &entry.bounds, &mut report);
                     } else {
                         self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
                     }
@@ -482,7 +490,8 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
         // SAFETY: `(x, y)` is a node of `grid`, and each neighbor is read only
         // after testing that it exists.
         unsafe {
-            grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+            grid.get_unchecked(y, x)
+                .pair_with_after(start, bounds, callback);
             if to_right {
                 grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
             }

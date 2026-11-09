@@ -434,7 +434,9 @@ impl MaxMultiset {
             assert!(!visited[index]);
             visited[index] = true;
             let branch = &set.branches[index];
-            assert!(branch.shift <= 60 && branch.shift.is_multiple_of(6) && branch.shift < parent_shift);
+            assert!(
+                branch.shift <= 60 && branch.shift.is_multiple_of(6) && branch.shift < parent_shift
+            );
             assert_eq!(branch.children.len(), branch.bitmap.count_ones() as usize);
             assert!((2..=64).contains(&branch.children.len()));
             let mut bitmap = branch.bitmap;
@@ -532,7 +534,12 @@ mod tests {
         let values = ordered_values();
         assert_eq!(key_of(f64::NEG_INFINITY), 0);
         for pair in values.windows(2) {
-            assert!(key_of(pair[0]) < key_of(pair[1]), "{} before {}", pair[0], pair[1]);
+            assert!(
+                key_of(pair[0]) < key_of(pair[1]),
+                "{} before {}",
+                pair[0],
+                pair[1]
+            );
         }
         for value in values {
             assert_eq!(value_of(key_of(value)).to_bits(), value.to_bits());

@@ -176,12 +176,15 @@ Structures of other research live in `lib::external` ([`src/external`](src/exter
 ## Benchmarks
 
 ```bash
+python benches/run_baseline.py NAME       # everything, in under 30 minutes; then: python benches/summarize_baseline.py NAME
 cargo bench --bench search
 cargo bench --bench update
 bash benches/run_frames.sh frames.jsonl   # then: python benches/summarize_frames.py frames.jsonl
 ```
 
-[`benches/frame.rs`](benches/frame.rs) times whole frames on one evolving state (move and update every ball, end the frame, then search with every ball or enumerate the pairs), one process per structure, mode, scene and seed, after checking the results of selected frames against a reference. `--moving SHARE` moves only that share of the balls; the warmup runs the queries only in its last 20 frames (`--warmup-queries`).
+[`benches/run_baseline.py`](benches/run_baseline.py) runs all of them on one commit, compiler and pinned core, and continues where it stopped if interrupted. The criterion benches take about 1.7 s per id, and arguments such as `-- --measurement-time 5 --sample-size 100` lengthen them; the noise lies mostly between processes, so another round says more than a longer one.
+
+[`benches/frame.rs`](benches/frame.rs) times whole frames on one evolving state (move and update every ball, end the frame, then search with every ball or enumerate the pairs), one process per structure, mode, scene and seed, after checking the results of selected frames against a reference. `--moving SHARE` moves only that share of the balls; the warmup runs the queries only in its last 5 frames (`--warmup-queries`), and `--frames` sets the timed frames, by default 100, or 40 in the 160k and tall16 scenes.
 
 Some mixed-distribution benchmarks are commented out in `criterion_group!` in [`benches/search.rs`](benches/search.rs); uncomment them to reproduce the tables. Scenes:
 

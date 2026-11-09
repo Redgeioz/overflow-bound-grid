@@ -17,10 +17,11 @@
 //! [`SpanGrid`] does.
 //!
 //! Insertion and update only widen the box of the target cell and the spans
-//! of its column and row, and mark the grid stale and the row touched; the
+//! of its column and row, and mark the grid stale and the cell changed; the
 //! copies in the neighbors are not updated. Until the refresh, the walk
-//! judges the neighbors of a query cell in or next to a touched row by the
-//! spans, as [`SpanGrid`] does. Removal and moving out leave boxes, spans
+//! judges the neighbors of a query cell next to a changed cell by the spans,
+//! as [`SpanGrid`] does, or, after a refresh that found many cells changed,
+//! those of a cell in or next to a touched row. Removal and moving out leave boxes, spans
 //! and copies unchanged, except that an emptied cell resets its box, so all
 //! three stay valid as items move, shrink or leave, and tighten only in
 //! [`refresh_bounds`], which also brings the copies of the rows near touched
@@ -73,12 +74,18 @@ pub struct HaloGrid<T: Copy> {
     /// growth by these three slices shifted the fields that the pair queries
     /// read and measured them 4-6% slower at 160,000 items in `SpanGrid`.
     marks: NodeMarks,
+    /// Whether the last refresh found the marks dense, by
+    /// [`NodeMarks::is_dense`].
+    dense_marks: bool,
 }
 
 impl<T: Copy> HaloGrid<T> {
     /// Create a grid of cells of about `cell_size` covering `world_bounds`.
     pub fn new(world_bounds: Rectangle, cell_size: f64) -> Self {
-        assert!(cell_size > 0.0 && cell_size.is_finite(), "invalid cell size");
+        assert!(
+            cell_size > 0.0 && cell_size.is_finite(),
+            "invalid cell size"
+        );
         let cols = (world_bounds.get_width() / cell_size).ceil().max(1.0) as usize;
         let rows = (world_bounds.get_height() / cell_size).ceil().max(1.0) as usize;
         let side = cols.max(rows) as f64 * cell_size;
@@ -105,6 +112,7 @@ impl<T: Copy> HaloGrid<T> {
             world_bounds,
             slots: Slots::new(),
             marks: NodeMarks::new(cols, rows),
+            dense_marks: false,
         }
     }
 
@@ -143,15 +151,18 @@ impl<T: Copy> HaloGrid<T> {
     #[cold]
     #[inline(never)]
     fn fits_walk_past_limit(&self, bounds: &Rectangle) -> bool {
-        self.fits_cell(bounds) && !self.out_of_reach(bounds, self.cell_containing(bounds.get_center()))
+        self.fits_cell(bounds)
+            && !self.out_of_reach(bounds, self.cell_containing(bounds.get_center()))
     }
 
     /// Cell whose area contains `point`, clamped into the grid.
     #[inline]
     fn cell_containing(&self, point: (f64, f64)) -> (usize, usize) {
         let (origin_x, origin_y) = self.root_bounds.get_min();
-        let x = (((point.0 - origin_x) * self.inverse_node_size.0) as usize).min(self.cells.cols() - 1);
-        let y = (((point.1 - origin_y) * self.inverse_node_size.1) as usize).min(self.cells.rows() - 1);
+        let x =
+            (((point.0 - origin_x) * self.inverse_node_size.0) as usize).min(self.cells.cols() - 1);
+        let y =
+            (((point.1 - origin_y) * self.inverse_node_size.1) as usize).min(self.cells.rows() - 1);
         (x, y)
     }
 
@@ -175,7 +186,13 @@ impl<T: Copy> HaloGrid<T> {
     #[cold]
     #[inline(never)]
     fn out_of_reach(&self, bounds: &Rectangle, cell: (usize, usize)) -> bool {
-        !within_reach(bounds, 0.0, self.root_bounds.get_min(), self.inverse_node_size, cell)
+        !within_reach(
+            bounds,
+            0.0,
+            self.root_bounds.get_min(),
+            self.inverse_node_size,
+            cell,
+        )
     }
 
     /// Cheap check that `position` would still return `(level, x, y)` for
@@ -255,6 +272,10 @@ impl<T: Copy> HaloGrid<T> {
     }
 
     /// Update the bounds of an item and, if necessary, its node.
+    ///
+    /// Call it only for items that moved or changed size. It does not compare
+    /// the bounds with the old ones, so an unchanged item still marks its node
+    /// and the next [`refresh_bounds`](Self::refresh_bounds) redoes that node.
     ///
     /// Panics if the handle has already been removed.
     pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
@@ -336,11 +357,11 @@ impl<T: Copy> HaloGrid<T> {
     /// tells apart).
     ///
     /// Where at most half the cells are marked, only the marked cells are
-    /// visited, after reading every mark: each shrinks its box and pushes its
+    /// visited, after reading the marks of the touched rows: each shrinks its box and pushes its
     /// sides to the copies its eight neighbors hold of it, and a column or row
     /// span is rebuilt only if a marked cell held one of its ends and no
     /// longer reaches it, or a cell in it emptied. Otherwise the boxes of the
-    /// touched rows shrink, the spans of those rows and of every column are
+    /// marked cells shrink, the spans of the touched rows and of every column are
     /// rebuilt, and each cell in or next to a touched row pulls the sides it
     /// needs from its neighbors, one row behind the shrinking, rather than
     /// each cell pushing its sides, which would first require resetting every
@@ -363,7 +384,9 @@ impl<T: Copy> HaloGrid<T> {
         let cells = &mut self.cells;
         let halo = &mut self.halo;
         let marks = &mut self.marks;
-        if sparse(marks.count(), marks.occupied(), cells.cols() * cells.rows()) {
+        let marked = marks.count(&lines.row_touched);
+        self.dense_marks = NodeMarks::is_dense(marked, marks.occupied());
+        if sparse(marked, marks.occupied(), cells.cols() * cells.rows()) {
             let size = (cells.cols(), cells.rows());
             let LineSpan {
                 columns,
@@ -372,7 +395,7 @@ impl<T: Copy> HaloGrid<T> {
                 stale,
                 ..
             } = lines;
-            marks.refresh(cells, columns, rows, |cell, bounds| {
+            marks.refresh(cells, columns, rows, row_touched, |cell, bounds| {
                 push_halo(halo, size, cell, bounds)
             });
             row_touched.fill(false);
@@ -384,30 +407,44 @@ impl<T: Copy> HaloGrid<T> {
         // boxes of all rows; a row's own span and boxes are rebuilt only if
         // the row is touched.
         lines.columns.fill(NOWHERE);
-        let shrink_row = |cells: &mut Grid<Node<T>>, lines: &mut LineSpan, y: usize| {
-            if lines.row_touched[y] {
-                lines.rows[y] = NOWHERE;
-                for (x, node) in cells[y].iter_mut().enumerate() {
-                    node.refresh();
-                    if !node.items.is_empty() {
-                        lines.widen((x, y), &node.bounds);
+        let shrink_row =
+            |cells: &mut Grid<Node<T>>, lines: &mut LineSpan, marks: &NodeMarks, y: usize| {
+                if lines.row_touched[y] {
+                    lines.rows[y] = NOWHERE;
+                    let row_marks = marks.row_ptr(y);
+                    for (x, node) in cells[y].iter_mut().enumerate() {
+                        // SAFETY: `x` is a column of row `y`, and the sweep stores
+                        // no marks.
+                        if unsafe { *row_marks.add(x) } == 0 {
+                            // The box still equals what the items give, since
+                            // every store and take marks. A path of its own, so
+                            // that the shrink below keeps the new box in registers
+                            // for the widening.
+                            if !node.items.is_empty() {
+                                lines.widen((x, y), &node.bounds);
+                            }
+                            continue;
+                        }
+                        node.refresh();
+                        if !node.items.is_empty() {
+                            lines.widen((x, y), &node.bounds);
+                        }
+                    }
+                } else {
+                    for (x, node) in cells[y].iter().enumerate() {
+                        if !node.items.is_empty() {
+                            lines.widen_column(x, &node.bounds);
+                        }
                     }
                 }
-            } else {
-                for (x, node) in cells[y].iter().enumerate() {
-                    if !node.items.is_empty() {
-                        lines.widen_column(x, &node.bounds);
-                    }
-                }
-            }
-        };
+            };
         // The copies of a row read the boxes of that row and the rows on
         // both sides, so they are pulled one row behind the shrinking, and
         // only if one of these three rows is touched.
-        shrink_row(cells, lines, 0);
+        shrink_row(cells, lines, marks, 0);
         for y in 0..rows {
             if y + 1 < rows {
-                shrink_row(cells, lines, y + 1);
+                shrink_row(cells, lines, marks, y + 1);
             }
             if lines.near_touched(y) {
                 pull_halo_row(cells, halo, y);
@@ -487,7 +524,8 @@ impl<T: Copy> HaloGrid<T> {
                     callback(found, entry.item);
                 }
             };
-            self.overflow.pair_with_after(index, &entry.bounds, &mut report);
+            self.overflow
+                .pair_with_after(index, &entry.bounds, &mut report);
             self.pair_scan(&entry.bounds, &mut report);
         }
     }
@@ -515,8 +553,8 @@ impl<T: Copy> HaloGrid<T> {
     #[inline]
     /// Search the half stencil of [`for_each_pair`]: cell `(x, y)` after its
     /// item `start`, and of the neighbors after it in row-major order those
-    /// that `walk_3x3` would visit for `bounds`, by the copies or, near a
-    /// touched row of a stale grid, by the spans.
+    /// that `walk_3x3` would visit for `bounds`, by the copies or, next to a
+    /// changed cell of a stale grid, by the spans.
     ///
     /// [`for_each_pair`]: Self::for_each_pair
     fn pair_half_stencil(
@@ -526,7 +564,7 @@ impl<T: Copy> HaloGrid<T> {
         bounds: &Rectangle,
         callback: &mut impl FnMut(T),
     ) {
-        if self.lines.stale && self.lines.near_touched(y) {
+        if self.lines.stale && self.after_changed((x, y)) {
             let grid = &self.cells;
             let lines = &self.lines;
             let (cols, rows) = (grid.cols(), grid.rows());
@@ -539,7 +577,8 @@ impl<T: Copy> HaloGrid<T> {
                 let down = (y + 1 != rows) & (bounds.max_y > below);
                 let before = (x != 0) & (bounds.min_x < left_of);
                 let after = (x + 1 != cols) & (bounds.max_x > right_of);
-                grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+                grid.get_unchecked(y, x)
+                    .pair_with_after(start, bounds, callback);
                 if after {
                     grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
                 }
@@ -560,11 +599,12 @@ impl<T: Copy> HaloGrid<T> {
                 let halo = self.halo.get_unchecked(y * grid.cols() + x);
                 let after = bounds.max_x > halo.right;
                 let down = bounds.max_y > halo.bottom;
-                let down_before = (bounds.min_x < halo.bottom_left[0])
-                    & (bounds.max_y > halo.bottom_left[1]);
-                let down_after = (bounds.max_x > halo.bottom_right[0])
-                    & (bounds.max_y > halo.bottom_right[1]);
-                grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+                let down_before =
+                    (bounds.min_x < halo.bottom_left[0]) & (bounds.max_y > halo.bottom_left[1]);
+                let down_after =
+                    (bounds.max_x > halo.bottom_right[0]) & (bounds.max_y > halo.bottom_right[1]);
+                grid.get_unchecked(y, x)
+                    .pair_with_after(start, bounds, callback);
                 if after {
                     grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
                 }
@@ -583,13 +623,39 @@ impl<T: Copy> HaloGrid<T> {
 
     fn walk_3x3<'a>(&'a self, bounds: &Rectangle, visit: impl FnMut(&'a Node<T>)) {
         let (x, y) = self.cell_containing(bounds.get_center());
-        // Copies can be behind only after a store, and then only near a
-        // touched row.
-        if self.lines.stale && self.lines.near_touched(y) {
+        // Copies can be behind only after a store, and then only next to the
+        // cell stored in.
+        if self.lines.stale && self.around_changed((x, y)) {
             self.walk_3x3_by_spans((x, y), bounds, visit);
         } else {
             self.walk_3x3_by_copies((x, y), bounds, visit);
         }
+    }
+
+    /// Whether the copies that a walk from cell `(x, y)` reads may be behind
+    /// the boxes they stand for.
+    #[inline(always)]
+    fn around_changed(&self, (x, y): (usize, usize)) -> bool {
+        if self.dense_marks {
+            return self.lines.near_touched(y);
+        }
+        let size = (self.cells.cols(), self.cells.rows());
+        debug_assert!(x < size.0 && y < size.1);
+        // SAFETY: the walks stay in the grid, so `(x, y)` is one of its cells.
+        unsafe { self.marks.any_around((x, y), size) }
+    }
+
+    /// [`around_changed`](Self::around_changed) for the half stencil of the
+    /// pair queries.
+    #[inline(always)]
+    fn after_changed(&self, (x, y): (usize, usize)) -> bool {
+        if self.dense_marks {
+            return self.lines.near_touched(y);
+        }
+        let size = (self.cells.cols(), self.cells.rows());
+        debug_assert!(x < size.0 && y < size.1);
+        // SAFETY: the pair walk visits only cells of the grid.
+        unsafe { self.marks.any_after((x, y), size) }
     }
 
     /// Visit cell `(x, y)` and those of its eight neighbors whose copies in
@@ -615,14 +681,12 @@ impl<T: Copy> HaloGrid<T> {
             let after = bounds.max_x > halo.right;
             let up = bounds.min_y < halo.top;
             let down = bounds.max_y > halo.bottom;
-            let up_before =
-                (bounds.min_x < halo.top_left[0]) & (bounds.min_y < halo.top_left[1]);
-            let up_after =
-                (bounds.max_x > halo.top_right[0]) & (bounds.min_y < halo.top_right[1]);
-            let down_before = (bounds.min_x < halo.bottom_left[0])
-                & (bounds.max_y > halo.bottom_left[1]);
-            let down_after = (bounds.max_x > halo.bottom_right[0])
-                & (bounds.max_y > halo.bottom_right[1]);
+            let up_before = (bounds.min_x < halo.top_left[0]) & (bounds.min_y < halo.top_left[1]);
+            let up_after = (bounds.max_x > halo.top_right[0]) & (bounds.min_y < halo.top_right[1]);
+            let down_before =
+                (bounds.min_x < halo.bottom_left[0]) & (bounds.max_y > halo.bottom_left[1]);
+            let down_after =
+                (bounds.max_x > halo.bottom_right[0]) & (bounds.max_y > halo.bottom_right[1]);
             debug_assert!(!(before | up_before | down_before) || x != 0);
             debug_assert!(!(after | up_after | down_after) || x + 1 != grid.cols());
             debug_assert!(!(up | up_before | up_after) || y != 0);
@@ -839,8 +903,8 @@ struct LineSpan {
     touched: bool,
     /// An item was stored since the last refresh, so a box may have grown
     /// past the copies of its sides held by the neighbors: until the
-    /// refresh, the walk judges the neighbors of a query cell in or next to a
-    /// touched row by the spans instead.
+    /// refresh, the walk judges the neighbors of a query cell next to a
+    /// changed cell by the spans instead.
     stale: bool,
     row_touched: Box<[bool]>,
 }
@@ -938,7 +1002,16 @@ impl Halo {
     /// the order left, right, top, bottom, top left, top right, bottom left,
     /// bottom right.
     const fn of_boxes(
-        [left, right, top, bottom, top_left, top_right, bottom_left, bottom_right]: [&Rectangle; 8],
+        [
+            left,
+            right,
+            top,
+            bottom,
+            top_left,
+            top_right,
+            bottom_left,
+            bottom_right,
+        ]: [&Rectangle; 8],
     ) -> Self {
         Self {
             left: left.max_x,
@@ -1173,7 +1246,11 @@ mod tests {
     fn assert_refreshed_extra(tree: &Tree, context: &str) {
         for y in 0..tree.cells.rows() {
             for x in 0..tree.cells.cols() {
-                assert_eq!(copies(tree, x, y), expected_copies(tree, x, y), "{context}, cell ({x}, {y})");
+                assert_eq!(
+                    copies(tree, x, y),
+                    expected_copies(tree, x, y),
+                    "{context}, cell ({x}, {y})"
+                );
             }
         }
     }

@@ -7,7 +7,7 @@
 //! hold items, or at most an eighth of all nodes, of a level are marked,
 //! [`NodeMarks::refresh`] shrinks the boxes of the marked nodes alone, and rebuilds a column or row span only if a marked node held
 //! one of its ends and no longer reaches it, or a node in it emptied; the
-//! grids sweep the other levels row by row as before. Either way leaves the
+//! grids sweep the other levels row by row. Either way leaves the
 //! boxes and spans computed from the items (a span end at zero may keep
 //! either sign, which no comparison tells apart).
 //!
@@ -17,6 +17,22 @@
 //! 0.65 ms for 160,000; with every ball moving, their update benchmarks
 //! measured 2-10% slower, reinsertion in the single-level grids the most
 //! (`bench-results/cell-refresh-2026-11-01.md`).
+//!
+//! Every mark lies in a touched row, so the marks are counted and found in
+//! those rows alone, which costs `mark` nothing. With 500 balls on 9 levels
+//! and 1% of them moving, where the marks span 84 KB and five nodes change,
+//! counting and finding them took about 16 of the 18 µs of a refresh, which
+//! now takes 2 µs, on a Core Ultra 9 275HX with rustc 1.99
+//! (`bench-results/n2-2026-11-09.md`).
+//!
+//! The row-by-row sweep of the other levels shrinks only the marked nodes of
+//! a touched row too, reading its marks through [`NodeMarks::row_ptr`]: a
+//! node no store or take reached still has the box its items give. With nine
+//! in ten of 160,000 balls lying still, 32 to a cell, the refresh of
+//! `HaloOverflowBoundGrid` took 0.70 times as long and its frame 0.97 times,
+//! on the same machine and compiler; with every ball moving, so that no node
+//! can be skipped, the refresh took 1.02 times as long and the frame did not
+//! change (`bench-results/n1-rustc199-2026-11-09.md`).
 
 use crate::overflow_bound::{higher, lower};
 use crate::rect::{NOWHERE, Rectangle};
@@ -36,6 +52,12 @@ pub(crate) const SPARSE_SHARE: usize = 2;
 /// many is marked, as in a sparse world where the sweep would mostly visit
 /// empty nodes.
 pub(crate) const SPARSE_NODES: usize = 8;
+
+/// A level whose last refresh found more than one occupied node in this many
+/// marked looks for no marks around a query until the next refresh, and
+/// goes by the touched rows: most nodes there have a marked neighbor, so
+/// reading the marks would rarely spare the fallback.
+pub(crate) const DENSE_MARKS: usize = 8;
 
 /// A node whose box covers its items.
 pub(crate) trait BoxedNode {
@@ -67,6 +89,17 @@ pub(crate) struct NodeMarks {
     loose_rows: Box<[bool]>,
 }
 
+/// The number of marks in `marks`. A mark is 0 or 1, so at most 255 of them
+/// sum within a byte, and bytes sum in vectors, where widening each to
+/// `usize` first took 8 µs for the 84 KB of marks of 9 levels.
+#[inline]
+fn count_marks(marks: &[u8]) -> usize {
+    marks
+        .chunks(255)
+        .map(|chunk| chunk.iter().sum::<u8>() as usize)
+        .sum()
+}
+
 impl NodeMarks {
     /// Marks for a grid of `cols` columns and `rows` rows, none set.
     pub(crate) fn new(cols: usize, rows: usize) -> Self {
@@ -94,6 +127,16 @@ impl NodeMarks {
         unsafe {
             *self.nodes.get_unchecked_mut(y * self.stride + x) = 1;
         }
+    }
+
+    /// The marks of row `y`, for a sweep that reads them while it changes
+    /// everything else of its level, and need not load the array and the
+    /// stride again for every node. The sweep must store no marks while it
+    /// reads them, and may read only the row's `cols` first bytes.
+    #[inline(always)]
+    pub(crate) fn row_ptr(&self, y: usize) -> *const u8 {
+        debug_assert!(y < self.loose_rows.len());
+        self.nodes.as_ptr().wrapping_add(y * self.stride)
     }
 
     /// Count one more node holding items: the caller stored the first item
@@ -126,9 +169,23 @@ impl NodeMarks {
         self.occupied
     }
 
-    /// Number of nodes marked since the last refresh; reads every mark.
-    pub(crate) fn count(&self) -> usize {
-        self.nodes.iter().map(|&marked| marked as usize).sum()
+    /// Number of nodes marked since the last refresh; reads the marks of the
+    /// rows flagged in `row_touched`, which must hold them all.
+    pub(crate) fn count(&self, row_touched: &[bool]) -> usize {
+        debug_assert!(row_touched.len() == self.loose_rows.len());
+        debug_assert!(
+            self.nodes
+                .chunks_exact(self.stride)
+                .zip(row_touched)
+                .all(|(row, &touched)| touched || row.iter().all(|&marked| marked == 0)),
+            "a mark outside the touched rows"
+        );
+        self.nodes
+            .chunks_exact(self.stride)
+            .zip(row_touched)
+            .filter(|&(_, &touched)| touched)
+            .map(|(row, _)| count_marks(row))
+            .sum()
     }
 
     /// Whether to refresh a level node by node, by [`SPARSE_SHARE`] and
@@ -136,6 +193,70 @@ impl NodeMarks {
     /// its `nodes` in all.
     pub(crate) fn is_sparse(marked: usize, occupied: usize, nodes: usize) -> bool {
         marked * SPARSE_SHARE <= occupied || marked * SPARSE_NODES <= nodes
+    }
+
+    /// Whether a level with `marked` of its `occupied` nodes marked is to go
+    /// by the touched rows, by [`DENSE_MARKS`].
+    pub(crate) fn is_dense(marked: usize, occupied: usize) -> bool {
+        marked * DENSE_MARKS > occupied
+    }
+
+    /// Whether one of the eight nodes around `(x, y)` of a grid of `cols` by
+    /// `rows` nodes is marked. At the edges of the grid the clamped indices
+    /// read the node itself, so that its own mark may answer true, which
+    /// costs a fallback and nothing else.
+    ///
+    /// Not inlined: inlined into the walks, this code measured the region
+    /// queries after a refresh, which never run it, 1-2% slower
+    /// (`bench-results/stale-marks-2026-11-09.md`).
+    ///
+    /// # Safety
+    ///
+    /// `(x, y)` must be a node of the grid the marks were made for, which
+    /// must have `cols` columns and `rows` rows.
+    #[inline(never)]
+    pub(crate) unsafe fn any_around(
+        &self,
+        (x, y): (usize, usize),
+        (cols, rows): (usize, usize),
+    ) -> bool {
+        let (left, right) = (x.saturating_sub(1), (x + 1).min(cols - 1));
+        let above = y.saturating_sub(1) * self.stride;
+        let middle = y * self.stride;
+        let below = (y + 1).min(rows - 1) * self.stride;
+        // SAFETY: every clamped index is a node of the grid, by the caller's
+        // guarantee.
+        let at = |row: usize, column: usize| unsafe { *self.nodes.get_unchecked(row + column) };
+        (at(above, left)
+            | at(above, x)
+            | at(above, right)
+            | at(middle, left)
+            | at(middle, right)
+            | at(below, left)
+            | at(below, x)
+            | at(below, right))
+            != 0
+    }
+
+    /// Whether the east, south-west, south or south-east neighbor of `(x, y)`
+    /// is marked, the four that a pair query reads, with the clamping of
+    /// [`any_around`](Self::any_around).
+    ///
+    /// # Safety
+    ///
+    /// As for [`any_around`](Self::any_around).
+    #[inline(never)]
+    pub(crate) unsafe fn any_after(
+        &self,
+        (x, y): (usize, usize),
+        (cols, rows): (usize, usize),
+    ) -> bool {
+        let (left, right) = (x.saturating_sub(1), (x + 1).min(cols - 1));
+        let middle = y * self.stride;
+        let below = (y + 1).min(rows - 1) * self.stride;
+        // SAFETY: as in `any_around`.
+        let at = |row: usize, column: usize| unsafe { *self.nodes.get_unchecked(row + column) };
+        (at(middle, right) | at(below, left) | at(below, x) | at(below, right)) != 0
     }
 
     /// Clear every mark; the count of occupied nodes stays.
@@ -154,13 +275,19 @@ impl NodeMarks {
             .filter(|&index| self.nodes[index] != 0)
             .map(|index| index / self.stride * cols + index % self.stride)
             .collect();
-        let loose = self.loose_columns.iter().chain(self.loose_rows.iter()).any(|&loose| loose);
+        let loose = self
+            .loose_columns
+            .iter()
+            .chain(self.loose_rows.iter())
+            .any(|&loose| loose);
         (nodes, loose)
     }
 
     /// Shrink the box of every marked node of `grid` to its items, call
     /// `refreshed` with the node and its new box, rebuild from the boxes the
     /// `columns` and `rows` spans that may have shrunk, and clear the marks.
+    /// Only the rows flagged in `row_touched` are read, which must hold every
+    /// mark.
     ///
     /// A span is the union of its boxes. Since the last refresh, every box
     /// only grew, except those that emptied, whose column and row
@@ -171,6 +298,7 @@ impl NodeMarks {
         grid: &mut Grid<N>,
         columns: &mut [[f64; 2]],
         rows: &mut [[f64; 2]],
+        row_touched: &[bool],
         mut refreshed: impl FnMut((usize, usize), &Rectangle),
     ) {
         let cols = grid.cols();
@@ -185,13 +313,19 @@ impl NodeMarks {
         } = self;
         let gave_up = |before: f64, now: f64, end: f64| before == end && now != before;
         for (y, row_marks) in nodes.chunks_exact_mut(*stride).enumerate() {
+            if !row_touched[y] {
+                continue;
+            }
             let (words, padding) = row_marks.as_chunks_mut::<8>();
             debug_assert!(padding.is_empty());
-            for (word, marks) in words.iter_mut().enumerate() {
+            // The search is a loop of its own: merged with the visits below,
+            // whose registers it then had to share, it kept its position on
+            // the stack and took about four times as long per word.
+            let mut words = words.iter_mut().enumerate();
+            while let Some((word, marks)) =
+                words.find(|(_, marks)| u64::from_le_bytes(**marks) != 0)
+            {
                 let mut marked = u64::from_le_bytes(*marks);
-                if marked == 0 {
-                    continue;
-                }
                 *marks = [0; 8];
                 let row = &mut grid[y];
                 let row_span = rows[y];
@@ -231,5 +365,27 @@ impl NodeMarks {
                 columns[x] = span;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row of more marks than a byte can sum counts in full, and a node
+    /// marked twice counts once.
+    #[test]
+    fn count_sums_the_touched_rows_however_long() {
+        let cols = 600;
+        let mut marks = NodeMarks::new(cols, 3);
+        for x in 0..cols {
+            // SAFETY: `x` is a column and 1 a row of the grid.
+            unsafe { marks.mark((x, 1)) };
+        }
+        for _ in 0..2 {
+            // SAFETY: 7 is a column and 2 a row of the grid.
+            unsafe { marks.mark((7, 2)) };
+        }
+        assert_eq!(marks.count(&[false, true, true]), cols + 1);
     }
 }

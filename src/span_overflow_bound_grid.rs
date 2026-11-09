@@ -1,9 +1,9 @@
-use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::cell_order::for_each_cell_hierarchically;
+use crate::exact_overflow_bound_grid::DirectionalOverflow;
+use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::layer_geometry::{
     LayerGeometry, Levels, build_levels, half_node_corners, scan_range, size_level, within_reach,
 };
-use crate::exact_overflow_bound_grid::DirectionalOverflow;
 use crate::node_marks::{BoxedNode, NodeMarks};
 use crate::overflow_bound::{cell_overflow, higher, lower};
 use crate::rect::{EMPTY, NOWHERE, Rectangle};
@@ -89,9 +89,7 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         Self::create::<true>(world_bounds)
     }
 
-    fn create<const FIT: bool>(
-        world_bounds: Rectangle,
-    ) -> SpanOverflowBoundGrid<T, MAX_LEVEL> {
+    fn create<const FIT: bool>(world_bounds: Rectangle) -> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         let Levels {
             layers,
             root_bounds,
@@ -174,10 +172,10 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
     /// which no comparison tells apart).
     ///
     /// Where at most half the nodes of a level are marked, only the marked
-    /// nodes are visited, after reading every mark, and a column or row span
+    /// nodes are visited, after reading the marks of the touched rows, and a column or row span
     /// is rebuilt only if a marked node held one of its ends and no longer
     /// reaches it, or a node in it emptied. Otherwise every node of the level
-    /// is visited once, with the items of its touched rows.
+    /// is visited once, with the items of the marked nodes.
     pub fn refresh_bounds(&mut self) {
         self.refresh_with(NodeMarks::is_sparse);
     }
@@ -200,7 +198,11 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
                 continue;
             }
             let grid = &mut self.layers[level];
-            if sparse(lines.marks.count(), lines.marks.occupied(), grid.cols() * grid.rows()) {
+            if sparse(
+                lines.marks.count(&lines.row_touched),
+                lines.marks.occupied(),
+                grid.cols() * grid.rows(),
+            ) {
                 let LineSpan {
                     columns,
                     rows,
@@ -208,7 +210,7 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
                     marks,
                     ..
                 } = lines;
-                marks.refresh(grid, columns, rows, |_, _| {});
+                marks.refresh(grid, columns, rows, row_touched, |_, _| {});
                 row_touched.fill(false);
                 continue;
             }
@@ -219,7 +221,20 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
             for y in 0..grid.rows() {
                 if std::mem::take(&mut lines.row_touched[y]) {
                     lines.rows[y] = NOWHERE;
+                    let row_marks = lines.marks.row_ptr(y);
                     for (x, node) in grid[y].iter_mut().enumerate() {
+                        // SAFETY: `x` is a column of row `y`, and the sweep
+                        // stores no marks.
+                        if unsafe { *row_marks.add(x) } == 0 {
+                            // The box still equals what the items give, since
+                            // every store and take marks. A path of its own,
+                            // so that the shrink below keeps the new box in
+                            // registers for the widening.
+                            if !node.items.is_empty() {
+                                lines.widen((x, y), &node.bounds);
+                            }
+                            continue;
+                        }
                         node.refresh();
                         if !node.items.is_empty() {
                             lines.widen((x, y), &node.bounds);
@@ -375,6 +390,10 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
 
     /// Update the bounds of an item and, if necessary, its node.
     ///
+    /// Call it only for items that moved or changed size. It does not compare
+    /// the bounds with the old ones, so an unchanged item still marks its node
+    /// and the next [`refresh_bounds`](Self::refresh_bounds) redoes that node.
+    ///
     /// Panics if the handle has already been removed.
     pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
         let location = self.slots.get(handle);
@@ -528,8 +547,9 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
     fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let layers = &self.layers;
         // Levels finer than the finest one holding items need no visit.
-        let Some(finest) =
-            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        let Some(finest) = (1..=MAX_LEVEL as usize)
+            .rev()
+            .find(|&level| !self.geometry[level].is_empty())
         else {
             return;
         };
@@ -548,7 +568,8 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
                         }
                     };
                     if level == 1 {
-                        self.get_root().pair_with_after(index, &entry.bounds, &mut report);
+                        self.get_root()
+                            .pair_with_after(index, &entry.bounds, &mut report);
                     } else {
                         self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
                     }
@@ -696,7 +717,8 @@ impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
             let down = (y + 1 != grid_height) & (bounds.max_y > below);
             let before = (x != 0) & (bounds.min_x < left_of);
             let after = (x + 1 != grid_width) & (bounds.max_x > right_of);
-            grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+            grid.get_unchecked(y, x)
+                .pair_with_after(start, bounds, callback);
             if after {
                 grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
             }

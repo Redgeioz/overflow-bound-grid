@@ -42,7 +42,11 @@ macro_rules! exact_reach_tests {
         }
 
         /// Jitter around one of `candidates`, or fall back to a uniform value.
-        fn near_one_of(rng: &mut StdRng, candidates: &[f64], fallback: std::ops::Range<f64>) -> f64 {
+        fn near_one_of(
+            rng: &mut StdRng,
+            candidates: &[f64],
+            fallback: std::ops::Range<f64>,
+        ) -> f64 {
             if candidates.is_empty() || rng.gen_bool(0.3) {
                 rng.gen_range(fallback)
             } else {
@@ -76,7 +80,9 @@ macro_rules! exact_reach_tests {
 
             // The edges between the cells; the root has none.
             let inner_edges = |cells: usize, origin: f64, node_size: f64| -> Vec<f64> {
-                (1..cells).map(|index| origin + node_size * index as f64).collect()
+                (1..cells)
+                    .map(|index| origin + node_size * index as f64)
+                    .collect()
             };
             let x_edges = inner_edges(grid.cols(), root.min_x, geometry.node_width);
             let y_edges = inner_edges(grid.rows(), root.min_y, geometry.node_height);
@@ -194,13 +200,20 @@ macro_rules! exact_reach_tests {
                         }
                         _ => tree.remove(handles.swap_remove(rng.gen_range(0..handles.len()))),
                     }
-                    assert_eq!(tree.coarsest_level(), coarsest_occupied(&tree), "step {step}");
+                    assert_eq!(
+                        tree.coarsest_level(),
+                        coarsest_occupied(&tree),
+                        "step {step}"
+                    );
                     if tree.coarsest_level() > before {
                         raised += 1;
                     }
                 }
                 // The coarsest level emptied out often enough to exercise clearing its bit.
-                assert!(raised > 100, "the coarsest level emptied only {raised} times");
+                assert!(
+                    raised > 100,
+                    "the coarsest level emptied only {raised} times"
+                );
             }
         }
     };
@@ -403,12 +416,27 @@ macro_rules! lazy_bound_tests {
                         let width = b.get_width() * rng.gen_range(0.1..8.0);
                         let height = b.get_height() * rng.gen_range(0.1..8.0);
                         match rng.gen_range(0..4) {
-                            0 => Rectangle::new(b.max_x.next_down(), b.min_y, b.max_x + width, b.max_y),
-                            1 => Rectangle::new(b.min_x - width, b.min_y, b.min_x.next_up(), b.max_y),
-                            2 => {
-                                Rectangle::new(b.min_x, b.max_y.next_down(), b.max_x, b.max_y + height)
+                            0 => Rectangle::new(
+                                b.max_x.next_down(),
+                                b.min_y,
+                                b.max_x + width,
+                                b.max_y,
+                            ),
+                            1 => {
+                                Rectangle::new(b.min_x - width, b.min_y, b.min_x.next_up(), b.max_y)
                             }
-                            _ => Rectangle::new(b.min_x, b.min_y - height, b.max_x, b.min_y.next_up()),
+                            2 => Rectangle::new(
+                                b.min_x,
+                                b.max_y.next_down(),
+                                b.max_x,
+                                b.max_y + height,
+                            ),
+                            _ => Rectangle::new(
+                                b.min_x,
+                                b.min_y - height,
+                                b.max_x,
+                                b.min_y.next_up(),
+                            ),
                         }
                     };
                     let expected: Vec<usize> = (0..items.len())
@@ -885,6 +913,30 @@ macro_rules! span_tests {
             assert_refreshed(&tree, "after the removal");
         }
 
+        /// The row-by-row sweep shrinks only the marked nodes of a touched
+        /// row: a box planted in an unmarked node of that row survives it,
+        /// which only a sweep that does not read the node's items allows.
+        #[test]
+        fn sweep_shrinks_only_marked_nodes() {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
+            let finest = MAX_LEVEL as usize;
+            // Finest nodes are 16 units wide: (6, 6) and (9, 6), in one row.
+            let moved = tree.insert(Rectangle::center_rect(100.0, 100.0, 4.0, 4.0), 0);
+            tree.insert(Rectangle::center_rect(150.0, 100.0, 4.0, 4.0), 1);
+            tree.refresh_with(|_, _, _| false);
+            let planted = Rectangle::center_rect(150.0, 100.0, 6.0, 6.0);
+            tree.layers[finest][6][9].bounds = planted.clone();
+            // Grow the box of (6, 6) past its item, which only a shrink undoes.
+            tree.update(Rectangle::center_rect(101.0, 100.0, 4.0, 4.0), moved);
+            tree.refresh_with(|_, _, _| false);
+            assert_eq!(tree.layers[finest][6][9].bounds, planted, "unmarked node");
+            assert_eq!(
+                tree.layers[finest][6][6].bounds,
+                Rectangle::center_rect(101.0, 100.0, 4.0, 4.0),
+                "marked node"
+            );
+        }
+
         /// Storing, replacing and taking an item marks its node, and a
         /// refresh clears the marks either way.
         #[test]
@@ -1281,6 +1333,29 @@ macro_rules! single_level_tests {
             assert_eq!(tree.lines.rows[6], [98.0, 102.0]);
             assert_eq!(tree.lines.columns[6], NOWHERE);
             assert_refreshed(&tree, "after the removal");
+        }
+
+        /// The row-by-row sweep shrinks only the marked cells of a touched
+        /// row: a box planted in an unmarked cell of that row survives it,
+        /// which only a sweep that does not read the cell's items allows.
+        #[test]
+        fn sweep_shrinks_only_marked_cells() {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0), 16.0);
+            // Cells are 16 units wide: (6, 6) and (9, 6), in one row.
+            let moved = tree.insert(Rectangle::center_rect(100.0, 100.0, 4.0, 4.0), 0);
+            tree.insert(Rectangle::center_rect(150.0, 100.0, 4.0, 4.0), 1);
+            tree.refresh_with(|_, _, _| false);
+            let planted = Rectangle::center_rect(150.0, 100.0, 6.0, 6.0);
+            tree.cells[6][9].bounds = planted.clone();
+            // Grow the box of (6, 6) past its item, which only a shrink undoes.
+            tree.update(Rectangle::center_rect(101.0, 100.0, 4.0, 4.0), moved);
+            tree.refresh_with(|_, _, _| false);
+            assert_eq!(tree.cells[6][9].bounds, planted, "unmarked cell");
+            assert_eq!(
+                tree.cells[6][6].bounds,
+                Rectangle::center_rect(101.0, 100.0, 4.0, 4.0),
+                "marked cell"
+            );
         }
 
         /// Storing, replacing and taking an item marks its cell, an item of

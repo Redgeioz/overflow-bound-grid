@@ -1,9 +1,10 @@
-use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::cell_order::for_each_cell_hierarchically;
-use crate::layer_geometry::{
-    LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level, within_reach,
-};
 use crate::exact_overflow_bound_grid::DirectionalOverflow;
+use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
+use crate::layer_geometry::{
+    LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level,
+    within_reach,
+};
 use crate::overflow_bound::{LevelReach, cell_overflow, higher, lower, rounding_slack};
 use crate::rect::{EMPTY, Rectangle};
 use grid::*;
@@ -224,7 +225,13 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
         let finer = level + 1;
         let (x, y) = self.cell_containing(finer, center);
         let origin = self.root_bounds.get_min();
-        if within_reach(bounds, rounding_slack(&self.root_bounds), origin, self.inverse_node_size[finer], (x, y)) {
+        if within_reach(
+            bounds,
+            rounding_slack(&self.root_bounds),
+            origin,
+            self.inverse_node_size[finer],
+            (x, y),
+        ) {
             return (finer, x, y);
         }
         let (x, y) = self.cell_containing(level, center);
@@ -461,8 +468,9 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
     fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let layers = &self.layers;
         // Levels finer than the finest one holding items need no visit.
-        let Some(finest) =
-            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        let Some(finest) = (1..=MAX_LEVEL as usize)
+            .rev()
+            .find(|&level| !self.geometry[level].is_empty())
         else {
             return;
         };
@@ -481,7 +489,8 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
                         }
                     };
                     if level == 1 {
-                        self.get_root().pair_with_after(index, &entry.bounds, &mut report);
+                        self.get_root()
+                            .pair_with_after(index, &entry.bounds, &mut report);
                     } else {
                         self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
                     }
@@ -527,53 +536,56 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
                 .zip(&self.reach[level + 1..=max_level])
                 .zip(&self.inverse_node_size[level + 1..=max_level])
                 .rev()
-                .for_each(|(((grid, geometry), reach), &(inverse_width, inverse_height))| {
-                    if geometry.is_empty() {
-                        return;
-                    }
-                    let grid_width = grid.cols();
-                    let grid_height = grid.rows();
+                .for_each(
+                    |(((grid, geometry), reach), &(inverse_width, inverse_height))| {
+                        if geometry.is_empty() {
+                            return;
+                        }
+                        let grid_width = grid.cols();
+                        let grid_height = grid.rows();
 
-                    // Cells at lower coordinates than the query range count as
-                    // far as their items reach in the positive direction, and
-                    // vice versa.
-                    // Coordinates are in nodes and the shrink in half nodes, so
-                    // the shrink counts half.
-                    let [left, right, top, bottom] = reach.shrink;
-                    // Both ends include a node whose items reach exactly to the
-                    // query, as in `scan_range`.
-                    let min_coord_x = first_reaching_node(min_x * inverse_width + right * 0.5);
-                    let min_coord_y = first_reaching_node(min_y * inverse_height + bottom * 0.5);
+                        // Cells at lower coordinates than the query range count as
+                        // far as their items reach in the positive direction, and
+                        // vice versa.
+                        // Coordinates are in nodes and the shrink in half nodes, so
+                        // the shrink counts half.
+                        let [left, right, top, bottom] = reach.shrink;
+                        // Both ends include a node whose items reach exactly to the
+                        // query, as in `scan_range`.
+                        let min_coord_x = first_reaching_node(min_x * inverse_width + right * 0.5);
+                        let min_coord_y =
+                            first_reaching_node(min_y * inverse_height + bottom * 0.5);
 
-                    let max_coord_x =
-                        last_reaching_node(max_x * inverse_width - left * 0.5).min(grid_width - 1);
-                    let max_coord_y =
-                        last_reaching_node(max_y * inverse_height - top * 0.5).min(grid_height - 1);
+                        let max_coord_x = last_reaching_node(max_x * inverse_width - left * 0.5)
+                            .min(grid_width - 1);
+                        let max_coord_y = last_reaching_node(max_y * inverse_height - top * 0.5)
+                            .min(grid_height - 1);
 
-                    // Scan the resulting range.
-                    for y in min_coord_y..=max_coord_y {
-                        for x in min_coord_x..=max_coord_x {
-                            let node = unsafe { grid.get_unchecked(y, x) };
-                            if node.items.is_empty() {
-                                continue;
-                            }
+                        // Scan the resulting range.
+                        for y in min_coord_y..=max_coord_y {
+                            for x in min_coord_x..=max_coord_x {
+                                let node = unsafe { grid.get_unchecked(y, x) };
+                                if node.items.is_empty() {
+                                    continue;
+                                }
 
-                            // The shrunk range lies within the fixed-reach range,
-                            // so its inner part lies within that of the latter.
-                            if y > min_coord_y + 1
-                                && y < max_coord_y - 1
-                                && x > min_coord_x + 1
-                                && x < max_coord_x - 1
-                            {
-                                // The node lies within the query, loose bounds
-                                // included, so its items need no intersection test.
-                                node.iter_items(&mut callback);
-                            } else {
-                                node.search_items(bounds, &mut callback);
+                                // The shrunk range lies within the fixed-reach range,
+                                // so its inner part lies within that of the latter.
+                                if y > min_coord_y + 1
+                                    && y < max_coord_y - 1
+                                    && x > min_coord_x + 1
+                                    && x < max_coord_x - 1
+                                {
+                                    // The node lies within the query, loose bounds
+                                    // included, so its items need no intersection test.
+                                    node.iter_items(&mut callback);
+                                } else {
+                                    node.search_items(bounds, &mut callback);
+                                }
                             }
                         }
-                    }
-                });
+                    },
+                );
         }
 
         if level == 1 {
@@ -614,7 +626,8 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
         // SAFETY: `(x, y)` is a node of `grid`, and each neighbor is read only
         // after testing that it exists.
         unsafe {
-            grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+            grid.get_unchecked(y, x)
+                .pair_with_after(start, bounds, callback);
             if to_right {
                 grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
             }
@@ -658,53 +671,55 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
             .zip(&self.reach[level + 1..=max_level])
             .zip(&self.inverse_node_size[level + 1..=max_level])
             .rev()
-            .for_each(|(((grid, geometry), reach), &(inverse_width, inverse_height))| {
-                if geometry.is_empty() {
-                    return;
-                }
-                let grid_width = grid.cols();
-                let grid_height = grid.rows();
+            .for_each(
+                |(((grid, geometry), reach), &(inverse_width, inverse_height))| {
+                    if geometry.is_empty() {
+                        return;
+                    }
+                    let grid_width = grid.cols();
+                    let grid_height = grid.rows();
 
-                // Cells at lower coordinates than the query range count as
-                // far as their items reach in the positive direction, and
-                // vice versa.
-                // Coordinates are in nodes and the shrink in half nodes, so
-                // the shrink counts half.
-                let [left, right, top, bottom] = reach.shrink;
-                // Both ends include a node whose items reach exactly to the
-                // query, as in `scan_range`.
-                let min_coord_x = first_reaching_node(min_x * inverse_width + right * 0.5);
-                let min_coord_y = first_reaching_node(min_y * inverse_height + bottom * 0.5);
+                    // Cells at lower coordinates than the query range count as
+                    // far as their items reach in the positive direction, and
+                    // vice versa.
+                    // Coordinates are in nodes and the shrink in half nodes, so
+                    // the shrink counts half.
+                    let [left, right, top, bottom] = reach.shrink;
+                    // Both ends include a node whose items reach exactly to the
+                    // query, as in `scan_range`.
+                    let min_coord_x = first_reaching_node(min_x * inverse_width + right * 0.5);
+                    let min_coord_y = first_reaching_node(min_y * inverse_height + bottom * 0.5);
 
-                let max_coord_x =
-                    last_reaching_node(max_x * inverse_width - left * 0.5).min(grid_width - 1);
-                let max_coord_y =
-                    last_reaching_node(max_y * inverse_height - top * 0.5).min(grid_height - 1);
+                    let max_coord_x =
+                        last_reaching_node(max_x * inverse_width - left * 0.5).min(grid_width - 1);
+                    let max_coord_y =
+                        last_reaching_node(max_y * inverse_height - top * 0.5).min(grid_height - 1);
 
-                // Scan the resulting range.
-                for y in min_coord_y..=max_coord_y {
-                    for x in min_coord_x..=max_coord_x {
-                        let node = unsafe { grid.get_unchecked(y, x) };
-                        if node.items.is_empty() {
-                            continue;
-                        }
+                    // Scan the resulting range.
+                    for y in min_coord_y..=max_coord_y {
+                        for x in min_coord_x..=max_coord_x {
+                            let node = unsafe { grid.get_unchecked(y, x) };
+                            if node.items.is_empty() {
+                                continue;
+                            }
 
-                        // The shrunk range lies within the fixed-reach range,
-                        // so its inner part lies within that of the latter.
-                        if y > min_coord_y + 1
-                            && y < max_coord_y - 1
-                            && x > min_coord_x + 1
-                            && x < max_coord_x - 1
-                        {
-                            // The node lies within `bounds`, loose bounds
-                            // included, so its items need no intersection test.
-                            node.pair_all(callback);
-                        } else {
-                            node.pair_with(bounds, callback);
+                            // The shrunk range lies within the fixed-reach range,
+                            // so its inner part lies within that of the latter.
+                            if y > min_coord_y + 1
+                                && y < max_coord_y - 1
+                                && x > min_coord_x + 1
+                                && x < max_coord_x - 1
+                            {
+                                // The node lies within `bounds`, loose bounds
+                                // included, so its items need no intersection test.
+                                node.pair_all(callback);
+                            } else {
+                                node.pair_with(bounds, callback);
+                            }
                         }
                     }
-                }
-            });
+                },
+            );
     }
 
     fn search_up_3x3(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {

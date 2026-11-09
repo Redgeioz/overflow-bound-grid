@@ -399,7 +399,8 @@ mod tests {
     fn random_bounds(rng: &mut StdRng, world: &Rectangle, cell: f64) -> Rectangle {
         let side = |rng: &mut StdRng| cell * 2f64.powf(rng.gen_range(-3.0..2.5));
         let (width, height) = (side(rng), side(rng));
-        let (x, y) = world.scale(1.0 + 2.0 * cell / world.get_width().min(world.get_height()))
+        let (x, y) = world
+            .scale(1.0 + 2.0 * cell / world.get_width().min(world.get_height()))
             .get_random_point(rng);
         let bounds = Rectangle::center_rect(x, y, width, height);
         if rng.gen_bool(0.5) {
@@ -435,14 +436,20 @@ mod tests {
                     for (class, list) in cell.classes.iter().enumerate() {
                         let count = list.iter().filter(|e| e.handle == *handle).count();
                         let expected = (class == class_of(range, x, y)) as usize;
-                        assert_eq!(count, expected, "item {item}, cell ({x}, {y}), class {class}");
+                        assert_eq!(
+                            count, expected,
+                            "item {item}, cell ({x}, {y}), class {class}"
+                        );
                     }
                     entries += 1;
                 }
             }
             // The first cell holds the entry in class A.
             let cell = &tree.cells[range.min_y as usize * tree.cols + range.min_x as usize];
-            let entry = cell.classes[A].iter().find(|e| e.handle == *handle).unwrap();
+            let entry = cell.classes[A]
+                .iter()
+                .find(|e| e.handle == *handle)
+                .unwrap();
             assert_eq!((&entry.bounds, entry.item), (bounds, *item));
         }
         let stored: usize = tree
@@ -539,15 +546,27 @@ mod tests {
     fn inverted_bounds_are_stored_nowhere() {
         let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 100.0, 100.0), 10.0);
         let handle = tree.insert(Rectangle::new(55.0, 15.0, 35.0, 25.0), 7);
-        assert!(tree.cells.iter().all(|cell| cell.classes.iter().all(Vec::is_empty)));
+        assert!(
+            tree.cells
+                .iter()
+                .all(|cell| cell.classes.iter().all(Vec::is_empty))
+        );
         let mut found = Vec::new();
-        tree.search(&Rectangle::new(0.0, 0.0, 100.0, 100.0), |item| found.push(item));
+        tree.search(&Rectangle::new(0.0, 0.0, 100.0, 100.0), |item| {
+            found.push(item)
+        });
         assert!(found.is_empty());
         tree.update(Rectangle::new(35.0, 15.0, 55.0, 25.0), handle);
-        tree.search(&Rectangle::new(0.0, 0.0, 100.0, 100.0), |item| found.push(item));
+        tree.search(&Rectangle::new(0.0, 0.0, 100.0, 100.0), |item| {
+            found.push(item)
+        });
         assert_eq!(found, [7]);
         tree.remove(handle);
-        assert!(tree.cells.iter().all(|cell| cell.classes.iter().all(Vec::is_empty)));
+        assert!(
+            tree.cells
+                .iter()
+                .all(|cell| cell.classes.iter().all(Vec::is_empty))
+        );
     }
 
     /// A query spanning several cells per axis finds an object covering all
@@ -558,7 +577,9 @@ mod tests {
         tree.insert(Rectangle::new(5.0, 5.0, 95.0, 95.0), 0);
         tree.insert(Rectangle::new(41.0, 41.0, 49.0, 49.0), 1);
         let mut found = Vec::new();
-        tree.search(&Rectangle::new(25.0, 25.0, 55.0, 55.0), |item| found.push(item));
+        tree.search(&Rectangle::new(25.0, 25.0, 55.0, 55.0), |item| {
+            found.push(item)
+        });
         found.sort_unstable();
         assert_eq!(found, [0, 1]);
     }

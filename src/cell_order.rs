@@ -26,7 +26,12 @@ pub(crate) fn for_each_cell_hierarchically(
             return;
         }
         let (cols, rows) = dims(level + 1);
-        for (cx, cy) in [(2 * x, 2 * y), (2 * x + 1, 2 * y), (2 * x, 2 * y + 1), (2 * x + 1, 2 * y + 1)] {
+        for (cx, cy) in [
+            (2 * x, 2 * y),
+            (2 * x + 1, 2 * y),
+            (2 * x, 2 * y + 1),
+            (2 * x + 1, 2 * y + 1),
+        ] {
             if cx < cols && cy < rows {
                 walk((level + 1, cx, cy), finest, dims, visit);
             }
@@ -42,7 +47,11 @@ pub(crate) fn for_each_cell_hierarchically(
 /// [`for_each_cell_hierarchically`] under coarser levels that halve it,
 /// rounding up, down to a single cell, which skips the parts of the
 /// enclosing power-of-two square outside the grid.
-pub(crate) fn for_each_cell_in_morton_order(cols: usize, rows: usize, mut visit: impl FnMut(usize, usize)) {
+pub(crate) fn for_each_cell_in_morton_order(
+    cols: usize,
+    rows: usize,
+    mut visit: impl FnMut(usize, usize),
+) {
     if cols == 0 || rows == 0 {
         return;
     }
@@ -77,10 +86,26 @@ mod tests {
             levels(3, square),
             vec![
                 (1, 0, 0),
-                (2, 0, 0), (3, 0, 0), (3, 1, 0), (3, 0, 1), (3, 1, 1),
-                (2, 1, 0), (3, 2, 0), (3, 3, 0), (3, 2, 1), (3, 3, 1),
-                (2, 0, 1), (3, 0, 2), (3, 1, 2), (3, 0, 3), (3, 1, 3),
-                (2, 1, 1), (3, 2, 2), (3, 3, 2), (3, 2, 3), (3, 3, 3),
+                (2, 0, 0),
+                (3, 0, 0),
+                (3, 1, 0),
+                (3, 0, 1),
+                (3, 1, 1),
+                (2, 1, 0),
+                (3, 2, 0),
+                (3, 3, 0),
+                (3, 2, 1),
+                (3, 3, 1),
+                (2, 0, 1),
+                (3, 0, 2),
+                (3, 1, 2),
+                (3, 0, 3),
+                (3, 1, 3),
+                (2, 1, 1),
+                (3, 2, 2),
+                (3, 3, 2),
+                (3, 2, 3),
+                (3, 3, 3),
             ]
         );
     }
@@ -99,7 +124,11 @@ mod tests {
         cells.sort();
         cells.dedup();
         assert_eq!(cells.len(), total);
-        assert!(cells.iter().all(|&(level, x, y)| x < wide(level).0 && y < wide(level).1));
+        assert!(
+            cells
+                .iter()
+                .all(|&(level, x, y)| x < wide(level).0 && y < wide(level).1)
+        );
     }
 
     fn order(cols: usize, rows: usize) -> Vec<(usize, usize)> {
@@ -113,10 +142,22 @@ mod tests {
         assert_eq!(
             order(4, 4),
             vec![
-                (0, 0), (1, 0), (0, 1), (1, 1),
-                (2, 0), (3, 0), (2, 1), (3, 1),
-                (0, 2), (1, 2), (0, 3), (1, 3),
-                (2, 2), (3, 2), (2, 3), (3, 3),
+                (0, 0),
+                (1, 0),
+                (0, 1),
+                (1, 1),
+                (2, 0),
+                (3, 0),
+                (2, 1),
+                (3, 1),
+                (0, 2),
+                (1, 2),
+                (0, 3),
+                (1, 3),
+                (2, 2),
+                (3, 2),
+                (2, 3),
+                (3, 3),
             ]
         );
     }
@@ -125,7 +166,10 @@ mod tests {
     /// others keep their Morton order.
     #[test]
     fn other_grids_visit_each_cell_once() {
-        assert_eq!(order(3, 2), vec![(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1)]);
+        assert_eq!(
+            order(3, 2),
+            vec![(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1)]
+        );
         assert_eq!(order(1, 1), vec![(0, 0)]);
         assert_eq!(order(0, 0), vec![]);
         for (cols, rows) in [(5, 3), (64, 32), (7, 9), (1, 6)] {

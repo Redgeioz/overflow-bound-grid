@@ -68,7 +68,9 @@ impl<T: Copy> MultiGrid<T> {
     pub fn new(world_bounds: Rectangle, cell_sizes: &[f64]) -> Self {
         assert!(!cell_sizes.is_empty(), "At least one collection is needed.");
         assert!(
-            cell_sizes.iter().all(|size| size.is_finite() && *size > 0.0),
+            cell_sizes
+                .iter()
+                .all(|size| size.is_finite() && *size > 0.0),
             "Cell sizes must be positive."
         );
         assert!(
@@ -416,16 +418,25 @@ mod tests {
                 Some(c) => &c.cells[y * c.cols + x][location.index as usize],
                 None => &tree.overflow[location.index as usize],
             };
-            assert_eq!((&entry.bounds, entry.item, entry.handle), (bounds, *item, *handle));
+            assert_eq!(
+                (&entry.bounds, entry.item, entry.handle),
+                (bounds, *item, *handle)
+            );
         }
-        let stored: usize = tree.collections.iter().map(|c| c.count).sum::<usize>() + tree.overflow.len();
+        let stored: usize =
+            tree.collections.iter().map(|c| c.count).sum::<usize>() + tree.overflow.len();
         assert_eq!(stored, live.len());
         for c in &tree.collections {
             assert_eq!(c.count, c.cells.iter().map(Vec::len).sum::<usize>());
         }
     }
 
-    fn assert_searches(tree: &Tree, live: &[(ItemHandle, Rectangle, usize)], rng: &mut StdRng, cells: &[f64]) {
+    fn assert_searches(
+        tree: &Tree,
+        live: &[(ItemHandle, Rectangle, usize)],
+        rng: &mut StdRng,
+        cells: &[f64],
+    ) {
         let world = tree.get_bounds().clone();
         for round in 0..200 {
             let query = if round % 2 == 0 || live.is_empty() {
@@ -461,7 +472,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0);
         for world in WORLDS {
             let side = world.get_width().min(world.get_height());
-            for cells in [vec![side / 64.0, side / 16.0, side / 4.0], vec![side / 32.0, side / 4.0]] {
+            for cells in [
+                vec![side / 64.0, side / 16.0, side / 4.0],
+                vec![side / 32.0, side / 4.0],
+            ] {
                 let mut tree = Tree::new(world.clone(), &cells);
                 let mut live: Vec<(ItemHandle, Rectangle, usize)> = Vec::new();
                 for step in 0..3000 {
@@ -476,7 +490,12 @@ mod tests {
                             let bounds = if rng.gen_bool(0.5) {
                                 let (x, y) = old.get_center();
                                 let step = old.get_width() * rng.gen_range(-0.3..0.3);
-                                Rectangle::center_rect(x + step, y - step, old.get_width(), old.get_height())
+                                Rectangle::center_rect(
+                                    x + step,
+                                    y - step,
+                                    old.get_width(),
+                                    old.get_height(),
+                                )
                             } else {
                                 random_bounds(&mut rng, &world, &cells)
                             };
@@ -506,9 +525,23 @@ mod tests {
     #[test]
     fn items_go_to_the_smallest_fitting_collection() {
         let tree = Tree::new(Rectangle::new(0.0, 0.0, 1000.0, 1000.0), &[10.0, 100.0]);
-        assert_eq!(tree.position(&Rectangle::center_rect(15.0, 25.0, 10.0, 4.0)), (0, 1, 2));
-        assert_eq!(tree.position(&Rectangle::center_rect(15.0, 25.0, 4.0, 10.5)), (1, 0, 0));
-        assert_eq!(tree.position(&Rectangle::center_rect(15.0, 25.0, 100.5, 4.0)).0, 2);
-        assert_eq!(tree.position(&Rectangle::center_rect(-1.0, 25.0, 4.0, 4.0)).0, 2);
+        assert_eq!(
+            tree.position(&Rectangle::center_rect(15.0, 25.0, 10.0, 4.0)),
+            (0, 1, 2)
+        );
+        assert_eq!(
+            tree.position(&Rectangle::center_rect(15.0, 25.0, 4.0, 10.5)),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            tree.position(&Rectangle::center_rect(15.0, 25.0, 100.5, 4.0))
+                .0,
+            2
+        );
+        assert_eq!(
+            tree.position(&Rectangle::center_rect(-1.0, 25.0, 4.0, 4.0))
+                .0,
+            2
+        );
     }
 }

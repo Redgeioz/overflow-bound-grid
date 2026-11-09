@@ -88,7 +88,11 @@ impl Event {
     }
 
     fn set_bounds(&mut self, bounds: &Rectangle) {
-        self.x = if self.leaving { bounds.max_x } else { bounds.min_x };
+        self.x = if self.leaving {
+            bounds.max_x
+        } else {
+            bounds.min_x
+        };
         self.min_x = bounds.min_x;
         self.min_y = bounds.min_y;
         self.max_x = bounds.max_x;
@@ -374,7 +378,11 @@ struct Scratch {
 /// `x` as an integer in the order of `f64::total_cmp`.
 fn order_key(x: f64) -> u64 {
     let bits = x.to_bits();
-    if bits >> 63 == 1 { !bits } else { bits | 1 << 63 }
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | 1 << 63
+    }
 }
 
 pub struct SpatialJoinSweep<T: Copy> {
@@ -516,15 +524,25 @@ impl<T: Copy> SpatialJoinSweep<T> {
             self.sweep_events(&self.events, &mut callback);
             return;
         }
-        let mut scratch = self.scratch.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut scratch = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Scratch { keys, events } = &mut *scratch;
         keys.clear();
         keys.extend(self.events.iter().zip(0..).map(|(event, position)| {
-            (order_key(event.x), (event.leaving as u32) << 31 | event.slot, position)
+            (
+                order_key(event.x),
+                (event.leaving as u32) << 31 | event.slot,
+                position,
+            )
         }));
         keys.sort_unstable();
         events.clear();
-        events.extend(keys.iter().map(|&(_, _, position)| self.events[position as usize]));
+        events.extend(
+            keys.iter()
+                .map(|&(_, _, position)| self.events[position as usize]),
+        );
         self.sweep_events(events, &mut callback);
     }
 
@@ -534,11 +552,18 @@ impl<T: Copy> SpatialJoinSweep<T> {
                 self.sweep(events, IntervalIdx::<BTreeSet<Interval>>::new(), callback)
             }
             ActiveSet::SortedVec => self.sweep(events, IntervalIdx::<SortedVec>::new(), callback),
-            ActiveSet::Cells(height) => self.sweep(events, CellIndex::new(events, height), callback),
+            ActiveSet::Cells(height) => {
+                self.sweep(events, CellIndex::new(events, height), callback)
+            }
         }
     }
 
-    fn sweep(&self, events: &[Event], mut active: impl ActiveIndex, callback: &mut impl FnMut(T, T)) {
+    fn sweep(
+        &self,
+        events: &[Event],
+        mut active: impl ActiveIndex,
+        callback: &mut impl FnMut(T, T),
+    ) {
         for event in events {
             if event.has_nan() {
                 continue;
@@ -561,7 +586,10 @@ impl<T: Copy> SpatialJoinSweep<T> {
                     && other.l < event.max_y
                     && event.min_y < other.r
                 {
-                    callback(self.items[event.slot as usize], self.items[other.slot as usize]);
+                    callback(
+                        self.items[event.slot as usize],
+                        self.items[other.slot as usize],
+                    );
                 }
             });
         }
@@ -637,9 +665,17 @@ mod tests {
             for (id, bounds) in items.iter().enumerate() {
                 sweep.insert(bounds.clone(), id);
             }
-            assert_eq!(pairs(&sweep), brute_force(&items), "{order:?} {active:?}, stale");
+            assert_eq!(
+                pairs(&sweep),
+                brute_force(&items),
+                "{order:?} {active:?}, stale"
+            );
             sweep.refresh_order();
-            assert_eq!(pairs(&sweep), brute_force(&items), "{order:?} {active:?}, refreshed");
+            assert_eq!(
+                pairs(&sweep),
+                brute_force(&items),
+                "{order:?} {active:?}, refreshed"
+            );
         }
     }
 
@@ -654,16 +690,32 @@ mod tests {
                 .collect();
             sweep.refresh_order();
             sweep.remove(handles[2]);
-            assert_eq!(pairs(&sweep), [(0, 1), (3, 4), (4, 5)], "{order:?} {active:?}");
+            assert_eq!(
+                pairs(&sweep),
+                [(0, 1), (3, 4), (4, 5)],
+                "{order:?} {active:?}"
+            );
             let reused = sweep.insert(Rectangle::new(100.0, 0.0, 101.0, 1.0), 9);
             assert_eq!(reused.index(), handles[2].index());
             sweep.refresh_order();
-            assert_eq!(pairs(&sweep), [(0, 1), (3, 4), (4, 5)], "{order:?} {active:?}");
+            assert_eq!(
+                pairs(&sweep),
+                [(0, 1), (3, 4), (4, 5)],
+                "{order:?} {active:?}"
+            );
             sweep.update(Rectangle::new(1.2, 0.5, 1.4, 0.6), reused);
             sweep.update(Rectangle::new(50.0, 0.0, 51.0, 1.0), handles[5]);
-            assert_eq!(pairs(&sweep), [(0, 1), (0, 9), (1, 9), (3, 4)], "{order:?} {active:?}");
+            assert_eq!(
+                pairs(&sweep),
+                [(0, 1), (0, 9), (1, 9), (3, 4)],
+                "{order:?} {active:?}"
+            );
             sweep.refresh_order();
-            assert_eq!(pairs(&sweep), [(0, 1), (0, 9), (1, 9), (3, 4)], "{order:?} {active:?}");
+            assert_eq!(
+                pairs(&sweep),
+                [(0, 1), (0, 9), (1, 9), (3, 4)],
+                "{order:?} {active:?}"
+            );
         }
     }
 
@@ -674,18 +726,37 @@ mod tests {
         for active in [ActiveSet::SortedVec, ActiveSet::Cells(2.0)] {
             let mut sweep = SpatialJoinSweep::new(EventOrder::Kept, active);
             let mut items: Vec<Rectangle> = (0..200)
-                .map(|id| Rectangle::new(id as f64, (id % 7) as f64, id as f64 + 3.0, (id % 7) as f64 + 2.0))
+                .map(|id| {
+                    Rectangle::new(
+                        id as f64,
+                        (id % 7) as f64,
+                        id as f64 + 3.0,
+                        (id % 7) as f64 + 2.0,
+                    )
+                })
                 .collect();
-            let handles: Vec<_> = items.iter().enumerate().map(|(id, b)| sweep.insert(b.clone(), id)).collect();
+            let handles: Vec<_> = items
+                .iter()
+                .enumerate()
+                .map(|(id, b)| sweep.insert(b.clone(), id))
+                .collect();
             sweep.refresh_order();
             for round in 0..2 {
                 for (id, bounds) in items.iter_mut().enumerate() {
-                    let x = if round == 0 { 199.0 - id as f64 } else { id as f64 * 0.5 };
+                    let x = if round == 0 {
+                        199.0 - id as f64
+                    } else {
+                        id as f64 * 0.5
+                    };
                     *bounds = Rectangle::new(x, bounds.min_y, x + 3.0, bounds.max_y);
                     sweep.update(bounds.clone(), handles[id]);
                 }
                 sweep.refresh_order();
-                assert_eq!(pairs(&sweep), brute_force(&items), "{active:?}, round {round}");
+                assert_eq!(
+                    pairs(&sweep),
+                    brute_force(&items),
+                    "{active:?}, round {round}"
+                );
             }
         }
     }

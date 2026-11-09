@@ -134,7 +134,11 @@ fn small_balls(c: &mut Criterion) {
     arm!(SpanOverflowBoundGrid);
     arm!(HaloOverflowBoundGrid);
     for (name, cell) in [("312", GRID_CELL_SIZE), ("156", HALF_CELL_SIZE)] {
-        bench_small_balls(&mut group, &format!("MultiGrid/{name}"), tree!(MultiGrid, &[cell]));
+        bench_small_balls(
+            &mut group,
+            &format!("MultiGrid/{name}"),
+            tree!(MultiGrid, &[cell]),
+        );
         arm!(UniformGrid / name, cell);
         arm!(TwoLayerGrid / name, cell);
         arm!(SpanGrid / name, cell);
@@ -508,9 +512,13 @@ fn pairs(c: &mut Criterion) {
     arm!("HaloGrid", tree!(HaloGrid, GRID_CELL_SIZE));
     arm!("LooseQuadTree", tree!(LooseQuadTree));
     arm!("SortAndSweep", SortAndSweep::new());
-    bench_pairs(&mut group, "SortAndSweep/scalar", SortAndSweep::new(), 5, |tree, callback| {
-        tree.for_each_pair_scalar(|a, b| callback(a, b))
-    });
+    bench_pairs(
+        &mut group,
+        "SortAndSweep/scalar",
+        SortAndSweep::new(),
+        5,
+        |tree, callback| tree.for_each_pair_scalar(|a, b| callback(a, b)),
+    );
     arm!("SortAndSweep/unsorted", UnsortedSweep(SortAndSweep::new()));
     group.finish();
 }
@@ -529,14 +537,30 @@ fn pairs_160k(c: &mut Criterion) {
             })
         };
     }
-    arm!("HierarchicalLooseGrid", HierarchicalLooseGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
-    arm!("HaloOverflowBoundGrid", HaloOverflowBoundGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
-    arm!("UniformGrid", UniformGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
-    arm!("TwoLayerGrid", TwoLayerGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
+    arm!(
+        "HierarchicalLooseGrid",
+        HierarchicalLooseGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone())
+    );
+    arm!(
+        "HaloOverflowBoundGrid",
+        HaloOverflowBoundGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone())
+    );
+    arm!(
+        "UniformGrid",
+        UniformGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE)
+    );
+    arm!(
+        "TwoLayerGrid",
+        TwoLayerGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE)
+    );
     arm!("SortAndSweep", SortAndSweep::new());
-    bench_pairs_on(&mut group, "SortAndSweep/scalar", SortAndSweep::new(), &bounds, |tree, callback| {
-        tree.for_each_pair_scalar(|a, b| callback(a, b))
-    });
+    bench_pairs_on(
+        &mut group,
+        "SortAndSweep/scalar",
+        SortAndSweep::new(),
+        &bounds,
+        |tree, callback| tree.for_each_pair_scalar(|a, b| callback(a, b)),
+    );
     arm!("SortAndSweep/unsorted", UnsortedSweep(SortAndSweep::new()));
     group.finish();
 }
@@ -566,10 +590,22 @@ fn search_160k(c: &mut Criterion) {
             });
         }};
     }
-    arm!("HierarchicalLooseGrid", HierarchicalLooseGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
-    arm!("HaloOverflowBoundGrid", HaloOverflowBoundGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
-    arm!("UniformGrid", UniformGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
-    arm!("TwoLayerGrid", TwoLayerGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
+    arm!(
+        "HierarchicalLooseGrid",
+        HierarchicalLooseGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone())
+    );
+    arm!(
+        "HaloOverflowBoundGrid",
+        HaloOverflowBoundGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone())
+    );
+    arm!(
+        "UniformGrid",
+        UniformGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE)
+    );
+    arm!(
+        "TwoLayerGrid",
+        TwoLayerGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE)
+    );
     group.finish();
 }
 
@@ -594,8 +630,9 @@ fn small_pairs(c: &mut Criterion) {
 }
 
 criterion_group!(
-    bench,
-    search,
+    name = bench;
+    config = criterion_config();
+    targets = search,
     small_balls,
     aligned,
     gap,

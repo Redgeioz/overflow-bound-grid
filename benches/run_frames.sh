@@ -20,7 +20,7 @@ out=$1
 rounds=${2:-2}
 shift $(($# < 2 ? $# : 2))
 seeds=("$@")
-[ ${#seeds[@]} -gt 0 ] || seeds=(0 1 2)
+[ ${#seeds[@]} -gt 0 ] || seeds=(0 1)
 
 read -r -a structures <<< "${STRUCTURES:-HaloOverflowBoundGrid SpanOverflowBoundGrid HierarchicalLooseGrid UniformGrid TwoLayerGrid SortAndSweep ParryBvh/rebuild-binned ParryBvh/rebuild-ploc ParryBvh/refit ParryBvh/refit-opt ParryBvh/refit-opt-m5 ParryBvh/refit-opt-m25 ParryBvh/reinsert-m25}"
 read -r -a modes <<< "${MODES:-search pairs}"
@@ -36,9 +36,7 @@ invocation="$source-$(date +%s)-$$"
 
 # The sweeps are not spatial indexes: their searches scan every item.
 skip() {
-    { [ "$2" = search ] && [[ "$1" == SortAndSweep* || "$1" == SpatialJoinSweep/* ]]; } ||
-        # The hierarchical structures have no levels for the tall worlds.
-        { [[ "$3" == tall* ]] && [[ "$1" =~ ^(Halo|Span)OverflowBoundGrid$|^HierarchicalLooseGrid$ ]]; }
+    [ "$2" = search ] && [[ "$1" == SortAndSweep* || "$1" == SpatialJoinSweep/* ]]
 }
 
 for scene in "${scenes[@]}"; do

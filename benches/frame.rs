@@ -15,15 +15,21 @@
 //! structures of a mode, scene and seed.
 //!
 //! ```text
-//! cargo bench --bench frame -- <structure> <search|pairs> <10k|160k>
+//! cargo bench --bench frame -- <structure> <search|pairs> <10k|160k|tall4|tall16>
 //!     [--seed N] [--warmup N] [--warmup-queries N] [--frames N] [--verify]
-//!     [--verify-every N] [--pool] [--moving SHARE [--rotate]]
+//!     [--verify-every N] [--pool] [--moving SHARE [--rotate]] [--stale]
 //! ```
 //!
 //! The warmup moves and updates, and runs the queries only in its last
-//! `--warmup-queries` frames (20 by default): the queries change no state.
+//! `--warmup-queries` frames (5 by default): the queries change no state.
+//! The timed frames are few, 100 or, in the largest scenes, 40: the noise lies
+//! between processes, whose memory layouts differ, so more runs say more than
+//! longer ones (`bench-results/baseline-2026-11-04.md`).
 //! `--moving` moves and updates only that share of the balls; with
 //! `--rotate`, each frame's share starts where the previous one ended.
+//! `--stale` runs the queries after the updates and before the end of the
+//! frame, for the structures that answer exactly before a refresh;
+//! `update_us` still includes the end of the frame.
 //!
 //! With `--verify` nothing is timed: the results of selected frames are
 //! checked against a reference computed outside the structure, every
@@ -51,7 +57,12 @@ use parry2d_f64::math::Vector;
 #[cfg(feature = "parry")]
 use parry2d_f64::partitioning::{Bvh, BvhLeafUpdateStatus, BvhNode, BvhWorkspace};
 
-#[allow(dead_code, unused_imports, unused_macros, reason = "only the scenes are used here")]
+#[allow(
+    dead_code,
+    unused_imports,
+    unused_macros,
+    reason = "only the scenes are used here"
+)]
 mod common;
 use common::*;
 
@@ -111,7 +122,11 @@ fn keep_pooled(ptr: *mut u8, layout: Layout) -> bool {
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut ptr = if pooled(layout) { take_pooled(layout) } else { std::ptr::null_mut() };
+        let mut ptr = if pooled(layout) {
+            take_pooled(layout)
+        } else {
+            std::ptr::null_mut()
+        };
         if ptr.is_null() {
             ptr = unsafe { System.alloc(layout) };
         }
@@ -185,7 +200,11 @@ fn page_faults() -> Option<u64> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
-        fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
+        fn K32GetProcessMemoryInfo(
+            process: isize,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
     }
     let mut counters = ProcessMemoryCounters::default();
     let size = size_of::<ProcessMemoryCounters>() as u32;
@@ -243,10 +262,13 @@ macro_rules! structure {
 
 structure!(HaloOverflowBoundGrid<usize, MAX_LEVEL>, refresh_bounds);
 structure!(HaloOverflowBoundGrid<usize, LARGE_MAX_LEVEL>, refresh_bounds);
+structure!(HaloOverflowBoundGrid<usize, TALL16_MAX_LEVEL>, refresh_bounds);
 structure!(SpanOverflowBoundGrid<usize, MAX_LEVEL>, refresh_bounds);
 structure!(SpanOverflowBoundGrid<usize, LARGE_MAX_LEVEL>, refresh_bounds);
+structure!(SpanOverflowBoundGrid<usize, TALL16_MAX_LEVEL>, refresh_bounds);
 structure!(HierarchicalLooseGrid<usize, MAX_LEVEL>);
 structure!(HierarchicalLooseGrid<usize, LARGE_MAX_LEVEL>);
+structure!(HierarchicalLooseGrid<usize, TALL16_MAX_LEVEL>);
 structure!(UniformGrid<usize>);
 structure!(SpanGrid<usize>, refresh_bounds);
 structure!(HaloGrid<usize>, refresh_bounds);
@@ -366,7 +388,11 @@ impl ParryRaw {
 impl Structure for ParryRaw {
     type Handle = usize;
     fn insert(&mut self, bounds: Rectangle, id: usize) -> usize {
-        assert_eq!(id, self.bounds.len(), "Items are numbered in order of insertion.");
+        assert_eq!(
+            id,
+            self.bounds.len(),
+            "Items are numbered in order of insertion."
+        );
         let leaf = grown(&bounds, self.margin);
         self.tree.insert(to_aabb(&leaf), id as u32);
         self.bounds.push(bounds);
@@ -418,7 +444,10 @@ impl Structure for ParryRaw {
             // node finds exactly the intersecting items.
             let strict = |node: &BvhNode| {
                 let (min, max) = (node.mins(), node.maxs());
-                min.x < bounds.max_x && bounds.min_x < max.x && min.y < bounds.max_y && bounds.min_y < max.y
+                min.x < bounds.max_x
+                    && bounds.min_x < max.x
+                    && min.y < bounds.max_y
+                    && bounds.min_y < max.y
             };
             for leaf in self.tree.leaves(strict) {
                 callback(leaf as usize);
@@ -434,12 +463,13 @@ impl Structure for ParryRaw {
     #[inline]
     fn pairs(&self, mut callback: impl FnMut(usize, usize)) {
         let mut workspace = self.pair_workspace.borrow_mut();
-        self.tree.traverse_bvtt_single_tree::<false>(&mut workspace, &mut |a, b| {
-            let (a, b) = (a as usize, b as usize);
-            if self.bounds[a].intersects(&self.bounds[b]) {
-                callback(a, b);
-            }
-        });
+        self.tree
+            .traverse_bvtt_single_tree::<false>(&mut workspace, &mut |a, b| {
+                let (a, b) = (a as usize, b as usize);
+                if self.bounds[a].intersects(&self.bounds[b]) {
+                    callback(a, b);
+                }
+            });
     }
     fn maintained(&self) -> Option<usize> {
         Some(self.last_maintained)
@@ -461,7 +491,9 @@ impl Skin {
     fn of(self, bounds: &Rectangle) -> f64 {
         match self {
             Skin::Fixed(skin) => skin,
-            Skin::Adaptive => (bounds.get_width().min(bounds.get_height()) * 0.125).clamp(4.0, 25.0),
+            Skin::Adaptive => {
+                (bounds.get_width().min(bounds.get_height()) * 0.125).clamp(4.0, 25.0)
+            }
         }
     }
 }
@@ -517,7 +549,11 @@ impl Structure for ParryRapier {
     type Handle = usize;
     fn insert(&mut self, bounds: Rectangle, id: usize) -> usize {
         // Rapier inserts the exact box; the skin comes with the first write.
-        assert_eq!(id, self.raw.bounds.len(), "Items are numbered in order of insertion.");
+        assert_eq!(
+            id,
+            self.raw.bounds.len(),
+            "Items are numbered in order of insertion."
+        );
         self.raw.tree.insert(to_aabb(&bounds), id as u32);
         self.raw.bounds.push(bounds);
         self.changed.push(id as u32);
@@ -530,9 +566,11 @@ impl Structure for ParryRapier {
             raw.tree.refit_without_resolve(&mut raw.workspace);
             self.optimize = false;
         }
-        let status = raw
-            .tree
-            .update_partially_if_present(to_aabb(&bounds), id as u32, self.skin.of(&bounds));
+        let status = raw.tree.update_partially_if_present(
+            to_aabb(&bounds),
+            id as u32,
+            self.skin.of(&bounds),
+        );
         if status == Some(BvhLeafUpdateStatus::UpdatedInPlace) {
             self.changed.push(id as u32);
             self.debt += 1;
@@ -605,6 +643,12 @@ impl Mode {
     }
 }
 
+/// Levels of the hierarchical structures in `tall16`. Their roots are squares
+/// as wide as the world is tall, so `tall4` needs `LARGE_MAX_LEVEL` and
+/// `tall16` two levels more for finest nodes of `GRID_CELL_SIZE`, as in the
+/// other scenes.
+const TALL16_MAX_LEVEL: u8 = LARGE_MAX_LEVEL + 2;
+
 /// The scenes of the benches: 10,000 balls in `BOUNDS`, or sixteen times as
 /// many at the same density in `LARGE_BOUNDS`; or, at the same density and
 /// width as `BOUNDS`, worlds 4 and 16 times as tall (`tall4`, `tall16`), whose
@@ -621,6 +665,8 @@ struct Options {
     warmup: usize,
     frames: usize,
     verify: bool,
+    /// Run the queries before the end of the frame.
+    stale: bool,
     /// Frames between checks of `--verify`, after the first three.
     verify_every: usize,
     /// Warmup frames at the end of the warmup that run the queries; the
@@ -662,8 +708,7 @@ fn moving_balls(scene: &Scene, seed: u64) -> Vec<Ball> {
 }
 
 /// Move `moving` balls one step, the first ones or, if `first` is not zero,
-/// those from `first` on, wrapping around; update their bounds and end the
-/// frame.
+/// those from `first` on, wrapping around, and update their bounds.
 fn step<S: Structure>(
     tree: &mut S,
     balls: &mut [Ball],
@@ -678,14 +723,12 @@ fn step<S: Structure>(
             balls[id].update(world);
             tree.update(balls[id].get_bounds(), handles[id]);
         }
-        tree.end_frame();
         return;
     }
     for (ball, &handle) in balls[..moving].iter_mut().zip(handles) {
         ball.update(world);
         tree.update(ball.get_bounds(), handle);
     }
-    tree.end_frame();
 }
 
 /// SplitMix64's finalizer, so that the sum of the results' hashes changes with
@@ -762,7 +805,13 @@ fn verify(tree: &impl Structure, mode: Mode, balls: &[Ball]) -> Result<(), Strin
             let mut expected: Vec<Vec<usize>> = bounds
                 .iter()
                 .enumerate()
-                .map(|(id, own)| if own.intersects(own) { vec![id] } else { Vec::new() })
+                .map(|(id, own)| {
+                    if own.intersects(own) {
+                        vec![id]
+                    } else {
+                        Vec::new()
+                    }
+                })
                 .collect();
             for (a, b) in reference_pairs(&bounds) {
                 expected[a].push(b);
@@ -775,7 +824,9 @@ fn verify(tree: &impl Structure, mode: Mode, balls: &[Ball]) -> Result<(), Strin
                 found.sort_unstable();
                 expected.sort_unstable();
                 if found != *expected {
-                    return Err(format!("search {query:?}: {found:?}, expected {expected:?}"));
+                    return Err(format!(
+                        "search {query:?}: {found:?}, expected {expected:?}"
+                    ));
                 }
             }
         }
@@ -798,7 +849,13 @@ fn summary(values: &[f64]) -> String {
     )
 }
 
-fn run<S: Structure>(name: &str, mode: Mode, scene: &Scene, options: &Options, create: impl FnOnce() -> S) {
+fn run<S: Structure>(
+    name: &str,
+    mode: Mode,
+    scene: &Scene,
+    options: &Options,
+    create: impl FnOnce() -> S,
+) {
     let mut balls = moving_balls(scene, options.seed);
     let mut handles: Vec<S::Handle> = Vec::with_capacity(balls.len());
     let before = LIVE.load(Relaxed);
@@ -822,13 +879,24 @@ fn run<S: Structure>(name: &str, mode: Mode, scene: &Scene, options: &Options, c
         let mut checked = 0;
         for frame in 0..total {
             step(&mut tree, &mut balls, &handles, &scene.world, moving, first);
+            if !options.stale {
+                tree.end_frame();
+            }
             advance(&mut first);
             if frame < 3 || frame % options.verify_every == 0 || frame + 1 == total {
                 if let Err(message) = verify(&tree, mode, &balls) {
-                    eprintln!("{name} {} {} seed {}: frame {frame}: {message}", mode.name(), scene.name, options.seed);
+                    eprintln!(
+                        "{name} {} {} seed {}: frame {frame}: {message}",
+                        mode.name(),
+                        scene.name,
+                        options.seed
+                    );
                     exit(1);
                 }
                 checked += 1;
+            }
+            if options.stale {
+                tree.end_frame();
             }
         }
         println!(
@@ -855,16 +923,28 @@ fn run<S: Structure>(name: &str, mode: Mode, scene: &Scene, options: &Options, c
         }
         let start = Instant::now();
         step(&mut tree, &mut balls, &handles, &scene.world, moving, first);
+        if !options.stale {
+            tree.end_frame();
+        }
         let updated = Instant::now();
         advance(&mut first);
         if frame.saturating_add(options.warmup_queries) < options.warmup {
+            if options.stale {
+                tree.end_frame();
+            }
             continue;
         }
         let (frame_count, frame_sum) = query(&tree, mode, &balls);
-        let done = Instant::now();
+        let queried = Instant::now();
+        let done = if options.stale {
+            tree.end_frame();
+            Instant::now()
+        } else {
+            queried
+        };
         if frame >= options.warmup {
-            update_us.push((updated - start).as_secs_f64() * 1e6);
-            query_us.push((done - updated).as_secs_f64() * 1e6);
+            update_us.push(((updated - start) + (done - queried)).as_secs_f64() * 1e6);
+            query_us.push((queried - updated).as_secs_f64() * 1e6);
             frame_us.push((done - start).as_secs_f64() * 1e6);
             if let Some(items) = tree.maintained() {
                 maintained.push(items as f64 / balls.len() as f64);
@@ -889,7 +969,7 @@ fn run<S: Structure>(name: &str, mode: Mode, scene: &Scene, options: &Options, c
         "{{\"structure\":\"{name}\",\"mode\":\"{}\",\"scene\":\"{}\",\"seed\":{},\"warmup\":{},\"warmup_queries\":{},\"frames\":{},\
          \"update_us\":{},\"query_us\":{},\"frame_us\":{},\"maintained\":{maintained},\
          \"setup_bytes\":{setup_bytes},\"end_bytes\":{end_bytes},\"peak_bytes\":{peak_bytes},\
-         \"allocs_per_frame\":{allocs_per_frame:.2},\"faults_per_frame\":{faults_per_frame},\"pool\":{},\"moving\":{},\"rotate\":{},\
+         \"allocs_per_frame\":{allocs_per_frame:.2},\"faults_per_frame\":{faults_per_frame},\"pool\":{},\"moving\":{},\"rotate\":{},\"stale\":{},\
          \"results\":{count},\"checksum\":\"{count}:{sum}\"}}",
         mode.name(),
         scene.name,
@@ -903,6 +983,7 @@ fn run<S: Structure>(name: &str, mode: Mode, scene: &Scene, options: &Options, c
         POOL_ON.load(Relaxed),
         options.moving,
         options.rotate,
+        options.stale,
     );
 }
 
@@ -933,7 +1014,7 @@ fn parry_config(variant: &str) -> Option<(Maintenance, f64)> {
 fn usage() -> ! {
     eprintln!(
         "usage: frame <structure> <search|pairs> <10k|160k|tall4|tall16> [--seed N] [--warmup N] [--warmup-queries N] [--frames N]\n\
-         [--verify [--verify-every N]] [--pool] [--moving SHARE [--rotate]]\n\
+         [--verify [--verify-every N]] [--pool] [--moving SHARE [--rotate]] [--stale]\n\
          structures: HaloOverflowBoundGrid, SpanOverflowBoundGrid, HierarchicalLooseGrid, UniformGrid,\n\
          TwoLayerGrid, SortAndSweep[/scalar], SpatialJoinSweep/<<sorted|kept>-<btree|vec>|kept-cells<height>>,\n\
          PackedRTree/<static-hilbert[-join]|geo-hilbert[-walk]|geo-str>[-coherent][-defer<percent>][-n<node size>], Null,\n\
@@ -945,7 +1026,10 @@ fn usage() -> ! {
 
 fn main() {
     // `cargo bench` adds `--bench`.
-    let args: Vec<String> = std::env::args().skip(1).filter(|arg| arg != "--bench").collect();
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| arg != "--bench")
+        .collect();
     if args.len() < 3 {
         usage();
     }
@@ -962,22 +1046,45 @@ fn main() {
         large: false,
     };
     let scene = match args[2].as_str() {
-        "10k" => Scene { name: "10k", world: BOUNDS, count: AMOUNT, large: false },
-        "160k" => Scene { name: "160k", world: LARGE_BOUNDS, count: LARGE_AMOUNT, large: true },
+        "10k" => Scene {
+            name: "10k",
+            world: BOUNDS,
+            count: AMOUNT,
+            large: false,
+        },
+        "160k" => Scene {
+            name: "160k",
+            world: LARGE_BOUNDS,
+            count: LARGE_AMOUNT,
+            large: true,
+        },
         "tall4" => tall("tall4", 4),
         "tall16" => tall("tall16", 16),
         _ => usage(),
     };
     let (warmup, frames) = match scene.name {
-        "160k" => (300, 200),
-        "tall16" => (100, 100),
-        _ => (300, 300),
+        "160k" => (300, 40),
+        "tall16" => (100, 40),
+        _ => (300, 100),
     };
-    let mut options =
-        Options { seed: SEED, warmup, frames, verify: false, verify_every: 25, warmup_queries: 20, moving: 1.0, rotate: false };
+    let mut options = Options {
+        seed: SEED,
+        warmup,
+        frames,
+        verify: false,
+        verify_every: 25,
+        warmup_queries: 5,
+        moving: 1.0,
+        rotate: false,
+        stale: false,
+    };
     let mut rest = args[3..].iter();
     while let Some(flag) = rest.next() {
-        let mut value = || rest.next().and_then(|value| value.parse().ok()).unwrap_or_else(|| usage());
+        let mut value = || {
+            rest.next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| usage())
+        };
         match flag.as_str() {
             "--seed" => options.seed = value() as u64,
             "--warmup" => options.warmup = value(),
@@ -986,8 +1093,12 @@ fn main() {
             "--verify" => options.verify = true,
             "--pool" => POOL_ON.store(true, Relaxed),
             "--rotate" => options.rotate = true,
+            "--stale" => options.stale = true,
             "--moving" => {
-                let share: f64 = rest.next().and_then(|value| value.parse().ok()).unwrap_or_else(|| usage());
+                let share: f64 = rest
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| usage());
                 if !(0.0..=1.0).contains(&share) {
                     usage();
                 }
@@ -998,16 +1109,37 @@ fn main() {
         }
     }
 
+    // Only these answer exactly before the end of the frame.
+    if options.stale
+        && !matches!(
+            name,
+            "HaloOverflowBoundGrid"
+                | "SpanOverflowBoundGrid"
+                | "HierarchicalLooseGrid"
+                | "UniformGrid"
+                | "SpanGrid"
+                | "HaloGrid"
+                | "TwoLayerGrid"
+        )
+    {
+        usage();
+    }
+
     let world = scene.world.clone();
     macro_rules! levels {
         ($tree:ident) => {
-            if scene.name.starts_with("tall") {
-                // Their square roots would not fit these worlds.
-                usage()
-            } else if scene.large {
-                run(name, mode, &scene, &options, || $tree::<usize, LARGE_MAX_LEVEL>::new(world))
+            if scene.name == "tall16" {
+                run(name, mode, &scene, &options, || {
+                    $tree::<usize, TALL16_MAX_LEVEL>::new(world)
+                })
+            } else if scene.large || scene.name == "tall4" {
+                run(name, mode, &scene, &options, || {
+                    $tree::<usize, LARGE_MAX_LEVEL>::new(world)
+                })
             } else {
-                run(name, mode, &scene, &options, || $tree::<usize, MAX_LEVEL>::new(world))
+                run(name, mode, &scene, &options, || {
+                    $tree::<usize, MAX_LEVEL>::new(world)
+                })
             }
         };
     }
@@ -1015,29 +1147,47 @@ fn main() {
         "HaloOverflowBoundGrid" => levels!(HaloOverflowBoundGrid),
         "SpanOverflowBoundGrid" => levels!(SpanOverflowBoundGrid),
         "HierarchicalLooseGrid" => levels!(HierarchicalLooseGrid),
-        "UniformGrid" => run(name, mode, &scene, &options, || UniformGrid::new(world, GRID_CELL_SIZE)),
-        "SpanGrid" => run(name, mode, &scene, &options, || SpanGrid::new(world, GRID_CELL_SIZE)),
-        "HaloGrid" => run(name, mode, &scene, &options, || HaloGrid::new(world, GRID_CELL_SIZE)),
-        "TwoLayerGrid" => run(name, mode, &scene, &options, || TwoLayerGrid::new(world, GRID_CELL_SIZE)),
+        "UniformGrid" => run(name, mode, &scene, &options, || {
+            UniformGrid::new(world, GRID_CELL_SIZE)
+        }),
+        "SpanGrid" => run(name, mode, &scene, &options, || {
+            SpanGrid::new(world, GRID_CELL_SIZE)
+        }),
+        "HaloGrid" => run(name, mode, &scene, &options, || {
+            HaloGrid::new(world, GRID_CELL_SIZE)
+        }),
+        "TwoLayerGrid" => run(name, mode, &scene, &options, || {
+            TwoLayerGrid::new(world, GRID_CELL_SIZE)
+        }),
         "SortAndSweep" => run(name, mode, &scene, &options, SortAndSweep::new),
-        "SortAndSweep/scalar" => run(name, mode, &scene, &options, || ScalarSweep(SortAndSweep::new())),
+        "SortAndSweep/scalar" => run(name, mode, &scene, &options, || {
+            ScalarSweep(SortAndSweep::new())
+        }),
         _ if name.starts_with("SpatialJoinSweep/") => {
             let (order, active) = match &name["SpatialJoinSweep/".len()..] {
                 "sorted-btree" => (EventOrder::Sorted, ActiveSet::BTree),
                 "sorted-vec" => (EventOrder::Sorted, ActiveSet::SortedVec),
                 "kept-btree" => (EventOrder::Kept, ActiveSet::BTree),
                 "kept-vec" => (EventOrder::Kept, ActiveSet::SortedVec),
-                variant => match variant.strip_prefix("kept-cells").and_then(|h| h.parse::<f64>().ok()) {
+                variant => match variant
+                    .strip_prefix("kept-cells")
+                    .and_then(|h| h.parse::<f64>().ok())
+                {
                     Some(height) if height > 0.0 => (EventOrder::Kept, ActiveSet::Cells(height)),
                     _ => usage(),
                 },
             };
-            run(name, mode, &scene, &options, || SpatialJoinSweep::new(order, active))
+            run(name, mode, &scene, &options, || {
+                SpatialJoinSweep::new(order, active)
+            })
         }
         #[cfg(feature = "parry")]
         _ if name.starts_with("ParryBvh/") => {
-            let (maintenance, margin) = parry_config(&name["ParryBvh/".len()..]).unwrap_or_else(|| usage());
-            run(name, mode, &scene, &options, || ParryBvh::new(maintenance, margin))
+            let (maintenance, margin) =
+                parry_config(&name["ParryBvh/".len()..]).unwrap_or_else(|| usage());
+            run(name, mode, &scene, &options, || {
+                ParryBvh::new(maintenance, margin)
+            })
         }
         "Null" => run(name, mode, &scene, &options, || Null),
         #[cfg(feature = "packed")]
@@ -1052,7 +1202,9 @@ fn main() {
             };
             let (variant, defer) = match variant.rsplit_once("-defer") {
                 Some((variant, percent)) => match percent.parse::<f64>() {
-                    Ok(percent) if percent >= 0.0 && percent.is_finite() => (variant, percent / 100.0),
+                    Ok(percent) if percent >= 0.0 && percent.is_finite() => {
+                        (variant, percent / 100.0)
+                    }
                     _ => usage(),
                 },
                 None => (variant, 0.0),
@@ -1078,7 +1230,10 @@ fn main() {
         _ if name.starts_with("ParryRapier/") => {
             let skin = match &name["ParryRapier/".len()..] {
                 "adaptive" => Skin::Adaptive,
-                variant => match variant.strip_prefix('m').and_then(|m| m.parse::<f64>().ok()) {
+                variant => match variant
+                    .strip_prefix('m')
+                    .and_then(|m| m.parse::<f64>().ok())
+                {
                     // Change detection needs a skin.
                     Some(skin) if skin > 0.0 => Skin::Fixed(skin),
                     _ => usage(),

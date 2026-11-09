@@ -130,7 +130,10 @@ impl<T: Copy> PackedRTree<T> {
     }
 
     pub fn with_node_size(packing: Packing, node_size: usize) -> Self {
-        assert!((2..=u16::MAX as usize).contains(&node_size), "A node holds 2 to 65535 children.");
+        assert!(
+            (2..=u16::MAX as usize).contains(&node_size),
+            "A node holds 2 to 65535 children."
+        );
         Self {
             packing,
             node_size,
@@ -227,7 +230,11 @@ impl<T: Copy> PackedRTree<T> {
     /// stay pending and do not count.
     pub fn refresh_tree(&mut self) {
         if !matches!(self.tree, Tree::Empty) {
-            let moved = self.pending.iter().filter(|&&slot| well_formed(&self.leaves[slot as usize].bounds)).count();
+            let moved = self
+                .pending
+                .iter()
+                .filter(|&&slot| well_formed(&self.leaves[slot as usize].bounds))
+                .count();
             if (moved + self.dead) as f64 <= self.defer * self.entries.len() as f64 {
                 return;
             }
@@ -287,12 +294,14 @@ impl<T: Copy> PackedRTree<T> {
         }
         self.tree = match self.packing {
             Packing::StaticHilbert | Packing::StaticHilbertJoin => {
-                let mut builder = StaticAABB2DIndexBuilder::new_with_node_size(count, self.node_size);
+                let mut builder =
+                    StaticAABB2DIndexBuilder::new_with_node_size(count, self.node_size);
                 add_all!(builder);
                 Tree::Static(builder.build().expect("Every counted item was added."))
             }
             Packing::GeoHilbert | Packing::GeoStr | Packing::GeoHilbertWalk => {
-                let mut builder = RTreeBuilder::<f64>::new_with_node_size(count as u32, self.node_size as u16);
+                let mut builder =
+                    RTreeBuilder::<f64>::new_with_node_size(count as u32, self.node_size as u16);
                 add_all!(builder);
                 Tree::Geo(if self.packing == Packing::GeoStr {
                     builder.finish::<STRSort>()
@@ -307,11 +316,14 @@ impl<T: Copy> PackedRTree<T> {
             match &self.tree {
                 Tree::Empty => {}
                 Tree::Static(tree) => {
-                    self.order.extend(tree.item_indices().iter().map(|&index| entries[index].slot));
+                    self.order
+                        .extend(tree.item_indices().iter().map(|&index| entries[index].slot));
                 }
                 Tree::Geo(tree) => {
                     let indices = tree.indices();
-                    self.order.extend((0..entries.len()).map(|position| entries[indices.get(position)].slot));
+                    self.order.extend(
+                        (0..entries.len()).map(|position| entries[indices.get(position)].slot),
+                    );
                 }
             }
         }
@@ -331,7 +343,14 @@ impl<T: Copy> PackedRTree<T> {
             Tree::Empty => {}
             Tree::Static(tree) => {
                 let mut stack = self.stack.take();
-                tree.visit_query_with_stack(min_x, min_y, max_x, max_y, &mut |index| found(index), &mut stack);
+                tree.visit_query_with_stack(
+                    min_x,
+                    min_y,
+                    max_x,
+                    max_y,
+                    &mut |index| found(index),
+                    &mut stack,
+                );
                 self.stack.set(stack);
             }
             Tree::Geo(tree) if self.packing == Packing::GeoHilbertWalk => {
@@ -464,7 +483,11 @@ impl<T: Copy> PackedRTree<T> {
 
 /// Call `found` with the insertion index of every leaf below `node` whose
 /// box meets `bounds`, edges included, through geo-index's `Node`.
-fn walk<T: RTreeIndex<f64>>(node: &Node<'_, f64, T>, bounds: &Rectangle, found: &mut impl FnMut(usize)) {
+fn walk<T: RTreeIndex<f64>>(
+    node: &Node<'_, f64, T>,
+    bounds: &Rectangle,
+    found: &mut impl FnMut(usize),
+) {
     let meets = |node: &Node<'_, f64, T>| {
         node.min_x() <= bounds.max_x
             && bounds.min_x <= node.max_x()
@@ -493,7 +516,11 @@ fn walk<T: RTreeIndex<f64>>(node: &Node<'_, f64, T>, bounds: &Rectangle, found: 
 /// items of `tree` whose boxes meet, edges included, by joining the tree with
 /// itself on its public node arrays. Every level of a packed tree is full but
 /// its last node, so both nodes of a pair are always on the same level.
-fn self_join(tree: &StaticAABB2DIndex<f64>, stack: &mut Vec<(usize, usize, usize)>, mut report: impl FnMut(usize, usize)) {
+fn self_join(
+    tree: &StaticAABB2DIndex<f64>,
+    stack: &mut Vec<(usize, usize, usize)>,
+    mut report: impl FnMut(usize, usize),
+) {
     let count = tree.count();
     if count < 2 {
         return;
@@ -593,7 +620,11 @@ mod tests {
             }
             assert_eq!(pairs(&tree), [(0, 1), (1, 2)], "{packing:?}");
             // Touching at x = 1.5 does not count.
-            assert_eq!(found(&tree, &Rectangle::new(1.5, 0.0, 1.9, 1.0)), [1], "{packing:?}");
+            assert_eq!(
+                found(&tree, &Rectangle::new(1.5, 0.0, 1.9, 1.0)),
+                [1],
+                "{packing:?}"
+            );
             // Removed right after a rebuild, with nothing pending.
             tree.remove(handles[1]);
             assert_eq!(found(&tree, &everything), [0, 2], "{packing:?}");
@@ -626,15 +657,27 @@ mod tests {
         }
         for packing in PACKINGS {
             let mut tree = PackedRTree::new(packing);
-            let handles: Vec<_> = items.iter().enumerate().map(|(id, b)| tree.insert(b.clone(), id)).collect();
+            let handles: Vec<_> = items
+                .iter()
+                .enumerate()
+                .map(|(id, b)| tree.insert(b.clone(), id))
+                .collect();
             for _ in 0..2 {
                 assert_eq!(pairs(&tree), expected, "{packing:?}");
                 tree.refresh_tree();
             }
-            assert_eq!(found(&tree, &Rectangle::new(0.4, 0.0, 1.1, 1.0)), [0, 2, 3], "{packing:?}");
+            assert_eq!(
+                found(&tree, &Rectangle::new(0.4, 0.0, 1.1, 1.0)),
+                [0, 2, 3],
+                "{packing:?}"
+            );
             tree.update(Rectangle::new(0.5, 0.5, 2.0, 2.0), handles[1]);
             tree.refresh_tree();
-            assert_eq!(found(&tree, &Rectangle::new(1.5, 1.5, 1.6, 1.6)), [1], "{packing:?}");
+            assert_eq!(
+                found(&tree, &Rectangle::new(1.5, 1.5, 1.6, 1.6)),
+                [1],
+                "{packing:?}"
+            );
         }
     }
 
@@ -654,26 +697,46 @@ mod tests {
             assert!(found(&tree, &old_place).is_empty(), "{packing:?}");
             tree.refresh_tree();
             assert!(found(&tree, &old_place).is_empty(), "{packing:?}");
-            assert_eq!(found(&tree, &Rectangle::new(99.0, 99.0, 102.0, 102.0)), [50]);
+            assert_eq!(
+                found(&tree, &Rectangle::new(99.0, 99.0, 102.0, 102.0)),
+                [50]
+            );
         }
     }
 
     fn random_box(rng: &mut StdRng) -> Rectangle {
         let (x, y) = (rng.gen_range(0.0..100.0), rng.gen_range(0.0..100.0));
-        Rectangle::new(x, y, x + rng.gen_range(0.5..6.0), y + rng.gen_range(0.5..6.0))
+        Rectangle::new(
+            x,
+            y,
+            x + rng.gen_range(0.5..6.0),
+            y + rng.gen_range(0.5..6.0),
+        )
     }
 
     /// Searches with `queries`, with every live item's bounds and with random
     /// boxes, and the pairs, against brute force over `items` (by id).
-    fn check(tree: &PackedRTree<usize>, items: &[Option<(ItemHandle, Rectangle)>], queries: &[Rectangle], rng: &mut StdRng, context: &str) {
-        let live: Vec<(usize, &Rectangle)> =
-            items.iter().enumerate().filter_map(|(id, item)| item.as_ref().map(|(_, bounds)| (id, bounds))).collect();
+    fn check(
+        tree: &PackedRTree<usize>,
+        items: &[Option<(ItemHandle, Rectangle)>],
+        queries: &[Rectangle],
+        rng: &mut StdRng,
+        context: &str,
+    ) {
+        let live: Vec<(usize, &Rectangle)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(id, item)| item.as_ref().map(|(_, bounds)| (id, bounds)))
+            .collect();
         let mut queries = queries.to_vec();
         queries.extend(live.iter().map(|(_, bounds)| (*bounds).clone()));
         queries.extend((0..40).map(|_| random_box(rng)));
         for query in &queries {
-            let expected: Vec<usize> =
-                live.iter().filter(|(_, bounds)| bounds.intersects(query)).map(|&(id, _)| id).collect();
+            let expected: Vec<usize> = live
+                .iter()
+                .filter(|(_, bounds)| bounds.intersects(query))
+                .map(|&(id, _)| id)
+                .collect();
             assert_eq!(found(tree, query), expected, "{context}: search {query:?}");
         }
         let mut expected = Vec::new();
@@ -697,7 +760,13 @@ mod tests {
     #[test]
     fn few_moves_are_found_before_and_between_rebuilds() {
         for packing in PACKINGS {
-            for (coherent, defer) in [(false, 0.0), (true, 0.0), (true, 0.02), (false, 1.0), (true, 1.0)] {
+            for (coherent, defer) in [
+                (false, 0.0),
+                (true, 0.0),
+                (true, 0.02),
+                (false, 1.0),
+                (true, 1.0),
+            ] {
                 let context = format!("{packing:?}, coherent {coherent}, defer {defer}");
                 let mut rng = StdRng::seed_from_u64(5);
                 let tree = PackedRTree::with_node_size(packing, 4).deferred(defer);
@@ -731,13 +800,29 @@ mod tests {
                         if let Some((handle, bounds)) = &mut items[id] {
                             old.push(bounds.clone());
                             *bounds = match rng.gen_range(0..10) {
-                                0 => Rectangle::new(f64::NAN, bounds.min_y, bounds.max_x, bounds.max_y),
+                                0 => Rectangle::new(
+                                    f64::NAN,
+                                    bounds.min_y,
+                                    bounds.max_x,
+                                    bounds.max_y,
+                                ),
                                 // Inverted in x.
-                                1 => Rectangle::new(bounds.max_x, bounds.min_y, bounds.min_x, bounds.max_y),
+                                1 => Rectangle::new(
+                                    bounds.max_x,
+                                    bounds.min_y,
+                                    bounds.min_x,
+                                    bounds.max_y,
+                                ),
                                 2..=4 => random_box(&mut rng),
                                 _ => {
-                                    let (dx, dy) = (rng.gen_range(-2.0..2.0), rng.gen_range(-2.0..2.0));
-                                    Rectangle::new(bounds.min_x + dx, bounds.min_y + dy, bounds.max_x + dx, bounds.max_y + dy)
+                                    let (dx, dy) =
+                                        (rng.gen_range(-2.0..2.0), rng.gen_range(-2.0..2.0));
+                                    Rectangle::new(
+                                        bounds.min_x + dx,
+                                        bounds.min_y + dy,
+                                        bounds.max_x + dx,
+                                        bounds.max_y + dy,
+                                    )
                                 }
                             };
                             changed |= well_formed(bounds);
@@ -758,28 +843,59 @@ mod tests {
                         items.push(Some((handle, bounds)));
                         changed = true;
                     }
-                    check(&tree, &items, &old, &mut rng, &format!("{context}, frame {frame}, moved"));
+                    check(
+                        &tree,
+                        &items,
+                        &old,
+                        &mut rng,
+                        &format!("{context}, frame {frame}, moved"),
+                    );
                     let rebuilds = tree.rebuilds();
                     tree.refresh_tree();
                     if !changed {
-                        assert_eq!(tree.rebuilds(), rebuilds, "{context}, frame {frame}: rebuilt without a change");
+                        assert_eq!(
+                            tree.rebuilds(),
+                            rebuilds,
+                            "{context}, frame {frame}: rebuilt without a change"
+                        );
                     }
                     if defer == 0.0 && changed {
-                        assert_eq!(tree.rebuilds(), rebuilds + 1, "{context}, frame {frame}: change not rebuilt");
+                        assert_eq!(
+                            tree.rebuilds(),
+                            rebuilds + 1,
+                            "{context}, frame {frame}: change not rebuilt"
+                        );
                     }
-                    if tree.pending.iter().any(|&slot| well_formed(&tree.leaves[slot as usize].bounds)) {
+                    if tree
+                        .pending
+                        .iter()
+                        .any(|&slot| well_formed(&tree.leaves[slot as usize].bounds))
+                    {
                         stale_frames += 1;
                     }
-                    check(&tree, &items, &old, &mut rng, &format!("{context}, frame {frame}, refreshed"));
+                    check(
+                        &tree,
+                        &items,
+                        &old,
+                        &mut rng,
+                        &format!("{context}, frame {frame}, refreshed"),
+                    );
                 }
                 // Whether the rebuilds were deferred as asked.
                 if defer == 0.0 {
                     assert_eq!(stale_frames, 0, "{context}");
                 } else if defer == 1.0 {
                     assert_eq!(tree.rebuilds(), 1, "{context}");
-                    assert!(stale_frames >= 70, "{context}: {stale_frames} frames with stale entries");
+                    assert!(
+                        stale_frames >= 70,
+                        "{context}: {stale_frames} frames with stale entries"
+                    );
                 } else {
-                    assert!(tree.rebuilds() > 2 && stale_frames > 10, "{context}: {} rebuilds, {stale_frames} stale frames", tree.rebuilds());
+                    assert!(
+                        tree.rebuilds() > 2 && stale_frames > 10,
+                        "{context}: {} rebuilds, {stale_frames} stale frames",
+                        tree.rebuilds()
+                    );
                 }
             }
         }

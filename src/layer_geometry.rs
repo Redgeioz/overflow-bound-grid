@@ -40,7 +40,10 @@ pub(crate) fn reach_margin(root_bounds: &Rectangle) -> f64 {
 /// sizes come out on the root.
 pub(crate) fn sizing_root(root_bounds: &Rectangle, finest_cells: f64) -> (f64, f64) {
     let shrink = reach_margin(root_bounds) * finest_cells;
-    (root_bounds.get_width() - shrink, root_bounds.get_height() - shrink)
+    (
+        root_bounds.get_width() - shrink,
+        root_bounds.get_height() - shrink,
+    )
 }
 
 /// Whether an item with `bounds` in node `(x, y)` of a level with these
@@ -220,10 +223,7 @@ impl LayerGeometry {
     /// about 3% slower, with the code alignment forced.
     #[inline]
     pub(crate) fn fits_node(&self, width: f64, height: f64) -> bool {
-        (width <= self.node_width)
-            & (height <= self.node_height)
-            & (width >= 0.0)
-            & (height >= 0.0)
+        (width <= self.node_width) & (height <= self.node_height) & (width >= 0.0) & (height >= 0.0)
     }
 
     /// The ranges of [`cell_x_ranges`](Self::cell_x_ranges) along one axis. The
@@ -290,7 +290,10 @@ pub(crate) fn build_levels<N, const FIT: bool>(
                 cols = (size as f64 / world_height * world_width).ceil() as usize;
             }
         }
-        layers.push(Grid::from_vec((0..rows * cols).map(|_| node()).collect(), cols));
+        layers.push(Grid::from_vec(
+            (0..rows * cols).map(|_| node()).collect(),
+            cols,
+        ));
         size = 1 << level;
     }
 
@@ -310,7 +313,12 @@ pub(crate) fn build_levels<N, const FIT: bool>(
     for (level, grid) in layers.iter().enumerate().skip(1) {
         let (node_width, node_height) =
             LayerGeometry::node_size(&root_bounds, grid.cols(), grid.rows());
-        geometry.push(LayerGeometry::new(&root_bounds, level, grid.cols(), grid.rows()));
+        geometry.push(LayerGeometry::new(
+            &root_bounds,
+            level,
+            grid.cols(),
+            grid.rows(),
+        ));
         inverse_node_size.push((1.0 / node_width, 1.0 / node_height));
     }
     let size_root = sizing_root(&root_bounds, n as f64);
@@ -415,14 +423,18 @@ pub(crate) fn scan_range(half: [i64; 4], shift: u32, last: (usize, usize)) -> [u
     // ceil(n - 1.5) is ceil(2n) / 2, rounded down, less one, and ceil(2n) on
     // this level is the finest ceil(2n) divided by 2^shift, rounded up;
     // saturating keeps a query at infinity in range.
-    let min = |half: i64| {
-        ((half.saturating_add((1 << shift) - 1) >> (shift + 1)) - 1).max(0) as usize
-    };
+    let min =
+        |half: i64| ((half.saturating_add((1 << shift) - 1) >> (shift + 1)) - 1).max(0) as usize;
     // floor(n + 0.5) is floor(2n + 1) / 2, rounded down.
     let max = |half: i64, last: usize| {
         (((half >> shift).saturating_add(1)) >> 1).clamp(0, last as i64) as usize
     };
-    [min(half[0]), min(half[1]), max(half[2], last.0), max(half[3], last.1)]
+    [
+        min(half[0]),
+        min(half[1]),
+        max(half[2], last.0),
+        max(half[3], last.1),
+    ]
 }
 
 /// First node whose items may reach a query, for `n` the query's minimum in
@@ -497,7 +509,11 @@ mod tests {
         let (whole, fraction) = (floor as i128, n - floor);
         let clamp = |v: i128| v.clamp(0, u64::MAX as i128) as usize;
         (
-            clamp(whole.saturating_sub(1).saturating_add((fraction > 0.5) as i128)),
+            clamp(
+                whole
+                    .saturating_sub(1)
+                    .saturating_add((fraction > 0.5) as i128),
+            ),
             clamp(whole.saturating_add((fraction >= 0.5) as i128)),
         )
     }
@@ -545,7 +561,11 @@ mod tests {
                         };
                         let mut value = value;
                         for _ in 0..rng.gen_range(0..3) {
-                            value = if rng.gen_bool(0.5) { value.next_up() } else { value.next_down() };
+                            value = if rng.gen_bool(0.5) {
+                                value.next_up()
+                            } else {
+                                value.next_down()
+                            };
                         }
                         value
                     };
@@ -659,9 +679,18 @@ mod tests {
     #[test]
     fn size_level_agrees_with_the_division() {
         let roots = [
-            1024.0, 20000.0, 999.8, 334.0, 512.0, 1e-10, 3.7e5, 1e300,
+            1024.0,
+            20000.0,
+            999.8,
+            334.0,
+            512.0,
+            1e-10,
+            3.7e5,
+            1e300,
             // Roots whose thresholds `root / 2^k` underflow for large `k`.
-            2f64.powi(-958), 1e-300, f64::MIN_POSITIVE,
+            2f64.powi(-958),
+            1e-300,
+            f64::MIN_POSITIVE,
         ];
         let specials = [
             0.0,

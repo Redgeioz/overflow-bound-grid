@@ -1,10 +1,11 @@
-use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::cell_order::for_each_cell_hierarchically;
+use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::layer_geometry::{
-    LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level, within_reach,
+    LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level,
+    within_reach,
 };
-use crate::overflow_bound::{higher, lower};
 use crate::overflow_bound::rounding_slack;
+use crate::overflow_bound::{higher, lower};
 use crate::rect::{EMPTY, Rectangle};
 use grid::*;
 
@@ -109,7 +110,9 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
         for level in 1..=MAX_LEVEL as usize {
             // Every node of a level without items has already reset its box.
             if !self.geometry[level].is_empty() {
-                self.layers[level].iter_mut().for_each(BoxedLooseGridNode::refresh);
+                self.layers[level]
+                    .iter_mut()
+                    .for_each(BoxedLooseGridNode::refresh);
             }
         }
     }
@@ -144,7 +147,13 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
         let finer = level + 1;
         let (x, y) = self.cell_containing(finer, center);
         let origin = self.root_bounds.get_min();
-        if within_reach(bounds, rounding_slack(&self.root_bounds), origin, self.inverse_node_size[finer], (x, y)) {
+        if within_reach(
+            bounds,
+            rounding_slack(&self.root_bounds),
+            origin,
+            self.inverse_node_size[finer],
+            (x, y),
+        ) {
             return (finer, x, y);
         }
         let (x, y) = self.cell_containing(level, center);
@@ -378,8 +387,9 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
     fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let layers = &self.layers;
         // Levels finer than the finest one holding items need no visit.
-        let Some(finest) =
-            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        let Some(finest) = (1..=MAX_LEVEL as usize)
+            .rev()
+            .find(|&level| !self.geometry[level].is_empty())
         else {
             return;
         };
@@ -398,7 +408,8 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
                         }
                     };
                     if level == 1 {
-                        self.get_root().pair_with_after(index, &entry.bounds, &mut report);
+                        self.get_root()
+                            .pair_with_after(index, &entry.bounds, &mut report);
                     } else {
                         self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
                     }
@@ -456,7 +467,8 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
                     let min_coord_y = first_reaching_node(min_y * inverse_height);
 
                     let max_coord_x = last_reaching_node(max_x * inverse_width).min(grid_width - 1);
-                    let max_coord_y = last_reaching_node(max_y * inverse_height).min(grid_height - 1);
+                    let max_coord_y =
+                        last_reaching_node(max_y * inverse_height).min(grid_height - 1);
 
                     // Scan the resulting range.
                     for y in min_coord_y..=max_coord_y {
@@ -514,7 +526,8 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
         // SAFETY: `(x, y)` is a node of `grid`, and each neighbor is read only
         // after testing that it exists.
         unsafe {
-            grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+            grid.get_unchecked(y, x)
+                .pair_with_after(start, bounds, callback);
             if to_right {
                 grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
             }

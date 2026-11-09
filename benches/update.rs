@@ -135,14 +135,26 @@ macro_rules! bench_all {
 fn update(c: &mut Criterion) {
     bench_all!(c, "update", bench_update);
     let mut group = c.benchmark_group("update");
-    bench_update(&mut group, "MultiGrid/2", tree!(MultiGrid, &MULTI_CELL_SIZES_2));
+    bench_update(
+        &mut group,
+        "MultiGrid/2",
+        tree!(MultiGrid, &MULTI_CELL_SIZES_2),
+    );
     bench_update(&mut group, "SortAndSweep", SortAndSweep::new());
-    bench_update(&mut group, "SortAndSweep/unsorted", UnsortedSweep(SortAndSweep::new()));
+    bench_update(
+        &mut group,
+        "SortAndSweep/unsorted",
+        UnsortedSweep(SortAndSweep::new()),
+    );
     group.finish();
 }
 
 /// [`bench_update`] for [`LARGE_AMOUNT`] balls in [`LARGE_BOUNDS`].
-fn bench_update_large(group: &mut BenchmarkGroup<WallTime>, name: &str, mut tree: impl QTree<usize>) {
+fn bench_update_large(
+    group: &mut BenchmarkGroup<WallTime>,
+    name: &str,
+    mut tree: impl QTree<usize>,
+) {
     let (mut balls, handles) = gen_balls_in(&mut tree, &LARGE_BOUNDS, LARGE_AMOUNT, SEED, 5);
 
     group.bench_function(name, |b| {
@@ -166,10 +178,22 @@ fn update_160k(c: &mut Criterion) {
             bench_update_large(&mut group, $name, $tree)
         };
     }
-    arm!("HierarchicalLooseGrid", HierarchicalLooseGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
-    arm!("HaloOverflowBoundGrid", HaloOverflowBoundGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
-    arm!("UniformGrid", UniformGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
-    arm!("TwoLayerGrid", TwoLayerGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
+    arm!(
+        "HierarchicalLooseGrid",
+        HierarchicalLooseGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone())
+    );
+    arm!(
+        "HaloOverflowBoundGrid",
+        HaloOverflowBoundGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone())
+    );
+    arm!(
+        "UniformGrid",
+        UniformGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE)
+    );
+    arm!(
+        "TwoLayerGrid",
+        TwoLayerGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE)
+    );
     arm!("SortAndSweep", SortAndSweep::new());
     arm!("SortAndSweep/unsorted", UnsortedSweep(SortAndSweep::new()));
     group.finish();
@@ -301,5 +325,9 @@ fn small_update(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(bench, update, reinsert, update_compare, small_update, update_160k);
+criterion_group!(
+    name = bench;
+    config = criterion_config();
+    targets = update, reinsert, update_compare, small_update, update_160k
+);
 criterion_main!(bench);

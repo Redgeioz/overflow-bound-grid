@@ -410,7 +410,10 @@ mod tests {
             assert!(found(&tree, &old_place).is_empty(), "{maintenance:?}");
             tree.refresh_tree();
             assert!(found(&tree, &old_place).is_empty(), "{maintenance:?}");
-            assert_eq!(found(&tree, &Rectangle::new(99.0, 99.0, 102.0, 102.0)), [50]);
+            assert_eq!(
+                found(&tree, &Rectangle::new(99.0, 99.0, 102.0, 102.0)),
+                [50]
+            );
         }
     }
 
@@ -420,7 +423,12 @@ mod tests {
     fn margins_keep_leaves_of_small_moves() {
         let mut tree = ParryBvh::new(Maintenance::RefitOptimize, 2.0);
         let handles: Vec<_> = (0..10)
-            .map(|id| tree.insert(Rectangle::new(10.0 * id as f64, 0.0, 10.0 * id as f64 + 1.0, 1.0), id))
+            .map(|id| {
+                tree.insert(
+                    Rectangle::new(10.0 * id as f64, 0.0, 10.0 * id as f64 + 1.0, 1.0),
+                    id,
+                )
+            })
             .collect();
         tree.refresh_tree();
         assert_eq!(tree.last_maintained(), 10);

@@ -173,8 +173,16 @@ mod tests {
         }
         for (extent, value) in [(0.0, -0.0), (-0.0, 0.0)] {
             let context = format!("extent {extent:?}, value {value:?}");
-            assert_eq!(lower(extent, value).to_bits(), f64::to_bits(extent), "{context}");
-            assert_eq!(higher(extent, value).to_bits(), f64::to_bits(extent), "{context}");
+            assert_eq!(
+                lower(extent, value).to_bits(),
+                f64::to_bits(extent),
+                "{context}"
+            );
+            assert_eq!(
+                higher(extent, value).to_bits(),
+                f64::to_bits(extent),
+                "{context}"
+            );
         }
     }
 }
