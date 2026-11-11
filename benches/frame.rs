@@ -7,6 +7,12 @@
 //! here see the state that the frame's updates left, which matters for the
 //! structures whose quality drifts between rebuilds.
 //!
+//! A run of `pairs` ends its frames as a caller that asks only for pairs
+//! would: since 2026-11-10, `HaloOverflowBoundGrid` and `HaloGrid` call
+//! `refresh_for_pairs` there, which leaves out what only region queries read.
+//! Earlier `pairs` lines of these two called `refresh_bounds` and do not
+//! compare with later ones.
+//!
 //! One run is one process for one structure, mode, scene and seed, so that
 //! runs share no heap state; `benches/run_frames.sh` runs them all. A run
 //! prints one JSON line: the update and query time of each timed frame, the
@@ -15,10 +21,17 @@
 //! structures of a mode, scene and seed.
 //!
 //! ```text
-//! cargo bench --bench frame -- <structure> <search|pairs> <10k|160k|tall4|tall16>
+//! cargo bench --bench frame -- <structure> <search|pairs> <10k|160k|tall4|tall16|small>
 //!     [--seed N] [--warmup N] [--warmup-queries N] [--frames N] [--verify]
 //!     [--verify-every N] [--pool] [--moving SHARE [--rotate]] [--stale]
 //! ```
+//!
+//! The balls of `10k`, `160k`, `tall4` and `tall16` have radii of 25 to 50
+//! that double up to five times, so the sizes are mixed. Since 2026-11-11,
+//! `small` has the 10,000 balls of `10k` with radii that never double, all
+//! smaller than a cell of the single-level grids, whose cells are 156.25 in
+//! this scene instead of 312.5. Single-level grids in the mixed scenes keep
+//! 312.5.
 //!
 //! The warmup moves and updates, and runs the queries only in its last
 //! `--warmup-queries` frames (5 by default): the queries change no state.
@@ -225,6 +238,10 @@ trait Structure {
     fn insert(&mut self, bounds: Rectangle, id: usize) -> Self::Handle;
     fn update(&mut self, bounds: Rectangle, handle: Self::Handle);
     fn end_frame(&mut self);
+    /// `end_frame` of a run that asks only for pairs.
+    fn end_frame_for_pairs(&mut self) {
+        self.end_frame();
+    }
     fn search(&self, bounds: &Rectangle, callback: impl FnMut(usize));
     fn pairs(&self, callback: impl FnMut(usize, usize));
     /// Items that the last `end_frame` maintained, where the structure counts
@@ -234,9 +251,10 @@ trait Structure {
     }
 }
 
-/// Implements [`Structure`] for `$tree`, whose `end_frame` calls `$end_frame`.
+/// Implements [`Structure`] for `$tree`, whose `end_frame` calls `$end_frame`
+/// and whose `end_frame_for_pairs` calls `$for_pairs`, where given.
 macro_rules! structure {
-    ($tree:ty $(, $end_frame:ident)?) => {
+    ($tree:ty $(, $end_frame:ident $(, $for_pairs:ident)?)?) => {
         impl Structure for $tree {
             type Handle = ItemHandle;
             fn insert(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
@@ -248,6 +266,11 @@ macro_rules! structure {
             fn end_frame(&mut self) {
                 $(self.$end_frame();)?
             }
+            $($(
+                fn end_frame_for_pairs(&mut self) {
+                    self.$for_pairs();
+                }
+            )?)?
             #[inline]
             fn search(&self, bounds: &Rectangle, callback: impl FnMut(usize)) {
                 <$tree>::search(self, bounds, callback);
@@ -260,18 +283,22 @@ macro_rules! structure {
     };
 }
 
-structure!(HaloOverflowBoundGrid<usize, MAX_LEVEL>, refresh_bounds);
-structure!(HaloOverflowBoundGrid<usize, LARGE_MAX_LEVEL>, refresh_bounds);
-structure!(HaloOverflowBoundGrid<usize, TALL16_MAX_LEVEL>, refresh_bounds);
+structure!(HaloOverflowBoundGrid<usize, MAX_LEVEL>, refresh_bounds, refresh_for_pairs);
+structure!(HaloOverflowBoundGrid<usize, LARGE_MAX_LEVEL>, refresh_bounds, refresh_for_pairs);
+structure!(HaloOverflowBoundGrid<usize, TALL16_MAX_LEVEL>, refresh_bounds, refresh_for_pairs);
 structure!(SpanOverflowBoundGrid<usize, MAX_LEVEL>, refresh_bounds);
 structure!(SpanOverflowBoundGrid<usize, LARGE_MAX_LEVEL>, refresh_bounds);
 structure!(SpanOverflowBoundGrid<usize, TALL16_MAX_LEVEL>, refresh_bounds);
 structure!(HierarchicalLooseGrid<usize, MAX_LEVEL>);
 structure!(HierarchicalLooseGrid<usize, LARGE_MAX_LEVEL>);
 structure!(HierarchicalLooseGrid<usize, TALL16_MAX_LEVEL>);
+structure!(BoxedLooseGrid<usize, MAX_LEVEL>, refresh_bounds);
+structure!(BoxedLooseGrid<usize, LARGE_MAX_LEVEL>, refresh_bounds);
+structure!(BoxedLooseGrid<usize, TALL16_MAX_LEVEL>, refresh_bounds);
 structure!(UniformGrid<usize>);
+structure!(MultiGrid<usize>);
 structure!(SpanGrid<usize>, refresh_bounds);
-structure!(HaloGrid<usize>, refresh_bounds);
+structure!(HaloGrid<usize>, refresh_bounds, refresh_for_pairs);
 structure!(TwoLayerGrid<usize>);
 structure!(SortAndSweep<usize>, refresh_order);
 structure!(SpatialJoinSweep<usize>, refresh_order);
@@ -649,15 +676,27 @@ impl Mode {
 /// other scenes.
 const TALL16_MAX_LEVEL: u8 = LARGE_MAX_LEVEL + 2;
 
+/// Cell size of the single-level grids in the `small` scene, whose balls all
+/// fit it: half the finest cell size, 156.25, as in the `small_balls` and
+/// `small_update` benches.
+const HALF_CELL_SIZE: f64 = GRID_CELL_SIZE / 2.0;
+
 /// The scenes of the benches: 10,000 balls in `BOUNDS`, or sixteen times as
 /// many at the same density in `LARGE_BOUNDS`; or, at the same density and
 /// width as `BOUNDS`, worlds 4 and 16 times as tall (`tall4`, `tall16`), whose
-/// columns hold more items, for the sweeps along x.
+/// columns hold more items, for the sweeps along x. In all of these the radii
+/// double up to five times. `small` is `10k` with radii that never double,
+/// diameters of 50 to 100, so that every ball fits a cell of the single-level
+/// grids.
 struct Scene {
     name: &'static str,
     world: Rectangle,
     count: usize,
     large: bool,
+    /// How often a radius may double, each time with a chance of a quarter.
+    doublings: usize,
+    /// Cell size of the single-level grids.
+    cell_size: f64,
 }
 
 struct Options {
@@ -682,14 +721,14 @@ struct Options {
 }
 
 /// The moving balls of `benches/update.rs`, drawn in the same order: radii
-/// doubled up to five times, each with a chance of a quarter.
+/// doubled up to `scene.doublings` times, each with a chance of a quarter.
 fn moving_balls(scene: &Scene, seed: u64) -> Vec<Ball> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     (0..scene.count)
         .map(|_| {
             let (x, y) = scene.world.get_random_point(&mut rng);
             let mut r = rng.gen_range(MIN_RADIUS..MAX_RADIUS);
-            for _ in 0..5 {
+            for _ in 0..scene.doublings {
                 if rng.gen_bool(0.25) {
                     r *= 2.0;
                 } else {
@@ -863,7 +902,11 @@ fn run<S: Structure>(
     for (id, ball) in balls.iter().enumerate() {
         handles.push(tree.insert(ball.get_bounds(), id));
     }
-    tree.end_frame();
+    let end_frame = |tree: &mut S| match mode {
+        Mode::Search => tree.end_frame(),
+        Mode::Pairs => tree.end_frame_for_pairs(),
+    };
+    end_frame(&mut tree);
     let setup_bytes = LIVE.load(Relaxed) - before;
     let total = options.warmup + options.frames;
     let moving = (balls.len() as f64 * options.moving).round() as usize;
@@ -880,7 +923,7 @@ fn run<S: Structure>(
         for frame in 0..total {
             step(&mut tree, &mut balls, &handles, &scene.world, moving, first);
             if !options.stale {
-                tree.end_frame();
+                end_frame(&mut tree);
             }
             advance(&mut first);
             if frame < 3 || frame % options.verify_every == 0 || frame + 1 == total {
@@ -896,7 +939,7 @@ fn run<S: Structure>(
                 checked += 1;
             }
             if options.stale {
-                tree.end_frame();
+                end_frame(&mut tree);
             }
         }
         println!(
@@ -924,20 +967,20 @@ fn run<S: Structure>(
         let start = Instant::now();
         step(&mut tree, &mut balls, &handles, &scene.world, moving, first);
         if !options.stale {
-            tree.end_frame();
+            end_frame(&mut tree);
         }
         let updated = Instant::now();
         advance(&mut first);
         if frame.saturating_add(options.warmup_queries) < options.warmup {
             if options.stale {
-                tree.end_frame();
+                end_frame(&mut tree);
             }
             continue;
         }
         let (frame_count, frame_sum) = query(&tree, mode, &balls);
         let queried = Instant::now();
         let done = if options.stale {
-            tree.end_frame();
+            end_frame(&mut tree);
             Instant::now()
         } else {
             queried
@@ -1013,10 +1056,10 @@ fn parry_config(variant: &str) -> Option<(Maintenance, f64)> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: frame <structure> <search|pairs> <10k|160k|tall4|tall16> [--seed N] [--warmup N] [--warmup-queries N] [--frames N]\n\
+        "usage: frame <structure> <search|pairs> <10k|160k|tall4|tall16|small> [--seed N] [--warmup N] [--warmup-queries N] [--frames N]\n\
          [--verify [--verify-every N]] [--pool] [--moving SHARE [--rotate]] [--stale]\n\
-         structures: HaloOverflowBoundGrid, SpanOverflowBoundGrid, HierarchicalLooseGrid, UniformGrid,\n\
-         TwoLayerGrid, SortAndSweep[/scalar], SpatialJoinSweep/<<sorted|kept>-<btree|vec>|kept-cells<height>>,\n\
+         structures: HaloOverflowBoundGrid, SpanOverflowBoundGrid, HierarchicalLooseGrid, BoxedLooseGrid, UniformGrid,\n\
+         TwoLayerGrid, SpanGrid, HaloGrid, MultiGrid/1, SortAndSweep[/scalar], SpatialJoinSweep/<<sorted|kept>-<btree|vec>|kept-cells<height>>,\n\
          PackedRTree/<static-hilbert[-join]|geo-hilbert[-walk]|geo-str>[-coherent][-defer<percent>][-n<node size>], Null,\n\
          ParryBvh/<variant>, ParryRaw/<variant>,\n\
          ParryRapier/<m<margin>|adaptive>; variants: <rebuild-binned|rebuild-ploc|refit|refit-opt|opt-refit|reinsert>[-m<margin>]"
@@ -1044,6 +1087,8 @@ fn main() {
         world: Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT * times as f64),
         count: AMOUNT * times,
         large: false,
+        doublings: 5,
+        cell_size: GRID_CELL_SIZE,
     };
     let scene = match args[2].as_str() {
         "10k" => Scene {
@@ -1051,15 +1096,27 @@ fn main() {
             world: BOUNDS,
             count: AMOUNT,
             large: false,
+            doublings: 5,
+            cell_size: GRID_CELL_SIZE,
         },
         "160k" => Scene {
             name: "160k",
             world: LARGE_BOUNDS,
             count: LARGE_AMOUNT,
             large: true,
+            doublings: 5,
+            cell_size: GRID_CELL_SIZE,
         },
         "tall4" => tall("tall4", 4),
         "tall16" => tall("tall16", 16),
+        "small" => Scene {
+            name: "small",
+            world: BOUNDS,
+            count: AMOUNT,
+            large: false,
+            doublings: 0,
+            cell_size: HALF_CELL_SIZE,
+        },
         _ => usage(),
     };
     let (warmup, frames) = match scene.name {
@@ -1126,6 +1183,7 @@ fn main() {
     }
 
     let world = scene.world.clone();
+    let cell_size = scene.cell_size;
     macro_rules! levels {
         ($tree:ident) => {
             if scene.name == "tall16" {
@@ -1147,17 +1205,22 @@ fn main() {
         "HaloOverflowBoundGrid" => levels!(HaloOverflowBoundGrid),
         "SpanOverflowBoundGrid" => levels!(SpanOverflowBoundGrid),
         "HierarchicalLooseGrid" => levels!(HierarchicalLooseGrid),
+        "BoxedLooseGrid" => levels!(BoxedLooseGrid),
         "UniformGrid" => run(name, mode, &scene, &options, || {
-            UniformGrid::new(world, GRID_CELL_SIZE)
+            UniformGrid::new(world, cell_size)
         }),
         "SpanGrid" => run(name, mode, &scene, &options, || {
-            SpanGrid::new(world, GRID_CELL_SIZE)
+            SpanGrid::new(world, cell_size)
         }),
         "HaloGrid" => run(name, mode, &scene, &options, || {
-            HaloGrid::new(world, GRID_CELL_SIZE)
+            HaloGrid::new(world, cell_size)
         }),
         "TwoLayerGrid" => run(name, mode, &scene, &options, || {
-            TwoLayerGrid::new(world, GRID_CELL_SIZE)
+            TwoLayerGrid::new(world, cell_size)
+        }),
+        // One collection: a single-level loose grid without bounds.
+        "MultiGrid/1" => run(name, mode, &scene, &options, || {
+            MultiGrid::new(world, &[cell_size])
         }),
         "SortAndSweep" => run(name, mode, &scene, &options, SortAndSweep::new),
         "SortAndSweep/scalar" => run(name, mode, &scene, &options, || {

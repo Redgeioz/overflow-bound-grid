@@ -29,6 +29,11 @@
 //! or centered outside the world go to one overflow node that every search
 //! reads.
 //!
+//! The pair queries go without the copies. Their walk comes to every cell,
+//! and at each reads the boxes of the four neighbors after it in row-major
+//! order, once for all the items of the cell. A box covers its items at all
+//! times, so before a refresh the pair queries need no spans either.
+//!
 //! [`HaloOverflowBoundGrid`]: crate::HaloOverflowBoundGrid
 //! [`SpanOverflowBoundGrid`]: crate::SpanOverflowBoundGrid
 //! [`SpanGrid`]: crate::SpanGrid
@@ -77,6 +82,11 @@ pub struct HaloGrid<T: Copy> {
     /// Whether the last refresh found the marks dense, by
     /// [`NodeMarks::is_dense`].
     dense_marks: bool,
+    /// A refresh for pairs left the copies behind the boxes, wherever those
+    /// changed: the walk goes by the spans throughout the grid, and the next
+    /// full refresh pulls the copies of every row. `lines.stale` is set with
+    /// it, so that a walk looks here only then.
+    copies_behind: bool,
 }
 
 impl<T: Copy> HaloGrid<T> {
@@ -113,6 +123,7 @@ impl<T: Copy> HaloGrid<T> {
             slots: Slots::new(),
             marks: NodeMarks::new(cols, rows),
             dense_marks: false,
+            copies_behind: false,
         }
     }
 
@@ -370,23 +381,53 @@ impl<T: Copy> HaloGrid<T> {
         self.refresh_with(NodeMarks::is_sparse);
     }
 
+    /// [`refresh_bounds`](Self::refresh_bounds) without the copies, for a
+    /// caller whose queries until the next refresh are all pair queries, which
+    /// read the boxes instead. The boxes and spans end up as after a full
+    /// refresh, and [`for_each_pair`](Self::for_each_pair) and
+    /// [`for_each_self_query`](Self::for_each_self_query) run as fast.
+    ///
+    /// [`search`](Self::search) stays exact, but after this refresh it judges
+    /// the neighbors of a query cell by the spans, as
+    /// [`SpanGrid`](crate::SpanGrid) does and at its cost. The next
+    /// [`refresh_bounds`](Self::refresh_bounds) brings back the copies by
+    /// sweeping every row, since it can no longer tell which of them fell
+    /// behind.
+    ///
+    /// With 160,000 balls, nine in ten of them still at 32 to a cell, the
+    /// refresh took 0.57 times as long and a frame of pair queries 0.92 times;
+    /// with 10,000 balls of the mixed distribution 0.87 and 0.99. A search
+    /// after it took 1.03 times as long on that distribution, on a Core Ultra
+    /// 9 275HX with rustc 1.99 (`bench-results/r3-pair-refresh-2026-11-10.md`).
+    pub fn refresh_for_pairs(&mut self) {
+        self.refresh_cells::<false>(NodeMarks::is_sparse);
+    }
+
     /// [`refresh_bounds`](Self::refresh_bounds), visiting only the marked
     /// cells where `sparse(marked, occupied, all cells)` holds and sweeping the rows
     /// otherwise.
     fn refresh_with(&mut self, sparse: impl Fn(usize, usize, usize) -> bool) {
+        self.refresh_cells::<true>(sparse);
+    }
+
+    /// With `COPIES` the refresh of [`refresh_bounds`](Self::refresh_bounds),
+    /// without it that of [`refresh_for_pairs`](Self::refresh_for_pairs).
+    fn refresh_cells<const COPIES: bool>(&mut self, sparse: impl Fn(usize, usize, usize) -> bool) {
         if std::mem::take(&mut self.overflow_touched) {
             self.overflow.refresh();
         }
-        if !std::mem::take(&mut self.lines.touched) {
+        let rebuild_copies = COPIES && self.copies_behind;
+        if !std::mem::take(&mut self.lines.touched) && !rebuild_copies {
             return;
         }
+        self.copies_behind = !COPIES;
         let lines = &mut self.lines;
         let cells = &mut self.cells;
         let halo = &mut self.halo;
         let marks = &mut self.marks;
         let marked = marks.count(&lines.row_touched);
         self.dense_marks = NodeMarks::is_dense(marked, marks.occupied());
-        if sparse(marked, marks.occupied(), cells.cols() * cells.rows()) {
+        if !rebuild_copies && sparse(marked, marks.occupied(), cells.cols() * cells.rows()) {
             let size = (cells.cols(), cells.rows());
             let LineSpan {
                 columns,
@@ -396,11 +437,17 @@ impl<T: Copy> HaloGrid<T> {
                 ..
             } = lines;
             marks.refresh(cells, columns, rows, row_touched, |cell, bounds| {
-                push_halo(halo, size, cell, bounds)
+                if COPIES {
+                    push_halo(halo, size, cell, bounds)
+                }
             });
             row_touched.fill(false);
-            *stale = false;
+            *stale = !COPIES;
             return;
+        }
+        if rebuild_copies {
+            // Every row is then rebuilt and pulls its copies.
+            lines.row_touched.fill(true);
         }
         let rows = cells.rows();
         // A column span runs across every row, so it is rebuilt from the
@@ -446,13 +493,13 @@ impl<T: Copy> HaloGrid<T> {
             if y + 1 < rows {
                 shrink_row(cells, lines, marks, y + 1);
             }
-            if lines.near_touched(y) {
+            if COPIES && lines.near_touched(y) {
                 pull_halo_row(cells, halo, y);
             }
         }
         lines.row_touched.fill(false);
         marks.clear();
-        lines.stale = false;
+        lines.stale = !COPIES;
     }
 
     /// Call `callback` with every stored item and each stored item whose bounds
@@ -475,7 +522,7 @@ impl<T: Copy> HaloGrid<T> {
     /// bounds intersect, with the two items in either order. An item in a
     /// cell reads only the items after it in its cell and the cells after its
     /// own in row-major order, that is the neighbor to the right and those in
-    /// the row below, where a search with its bounds would read them. The
+    /// the row below, each only if its box reaches the item. The
     /// items of the overflow node pair up with the overflow items after them
     /// and scan every cell within half a cell of their bounds, as a search with
     /// bounds larger than a cell does, so a pair of a cell item and an overflow
@@ -501,17 +548,8 @@ impl<T: Copy> HaloGrid<T> {
     fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let cells = &self.cells;
         for_each_cell_in_morton_order(cells.cols(), cells.rows(), |x, y| {
-            for (index, entry) in cells[y][x].items.iter().enumerate() {
-                if SELF_QUERY && entry.bounds.intersects(&entry.bounds) {
-                    callback(entry.item, entry.item);
-                }
-                let mut report = |found| {
-                    callback(entry.item, found);
-                    if SELF_QUERY {
-                        callback(found, entry.item);
-                    }
-                };
-                self.pair_half_stencil((x, y), index, &entry.bounds, &mut report);
+            if !cells[y][x].items.is_empty() {
+                self.pair_cell::<SELF_QUERY>((x, y), &mut callback);
             }
         });
         for (index, entry) in self.overflow.items.iter().enumerate() {
@@ -527,6 +565,87 @@ impl<T: Copy> HaloGrid<T> {
             self.overflow
                 .pair_with_after(index, &entry.bounds, &mut report);
             self.pair_scan(&entry.bounds, &mut report);
+        }
+    }
+
+    /// The pair walk at cell `(x, y)`, which holds items: each item with the
+    /// items after it in the cell and with those of the four neighbors after
+    /// the cell in row-major order whose boxes reach it.
+    ///
+    /// The four neighbors are judged by their own boxes as they are now, read
+    /// once for the cell, not by the copies of them that the cell holds, as in
+    /// [`HaloOverflowBoundGrid`](crate::HaloOverflowBoundGrid): a box covers
+    /// its items at all times, so the walk reads neither the copies nor the
+    /// marks and never falls back to the spans. Reading the cell's copies and
+    /// checking for stale ones once per item instead, the pair query took
+    /// 1.05 to 1.06 times as long on the mixed distribution with 312.5-unit
+    /// cells, 1.15 times with 32 balls to a cell, and 1.25 to 1.31 times
+    /// before a refresh, on a Core Ultra 9 275HX with rustc 1.99
+    /// (`bench-results/halo-review-2026-11-09.md`).
+    ///
+    /// Not inlined: inlined into the walk it measured 3% slower on the mixed
+    /// distribution, 11-12% slower with 32 balls to a cell, and took 1.3 to
+    /// 1.8 times as long with 500 to 2,000 balls on 128 by 128 cells.
+    #[inline(never)]
+    fn pair_cell<const SELF_QUERY: bool>(
+        &self,
+        (x, y): (usize, usize),
+        callback: &mut impl FnMut(T, T),
+    ) {
+        let grid = &self.cells;
+        let node = &grid[y][x];
+        let (has_left, has_right) = (x > 0, x + 1 < grid.cols());
+        let has_below = y + 1 < grid.rows();
+        // SAFETY: `(x, y)` is a cell of `grid`, and a neighbor is read only
+        // if the grid has it.
+        let (right, below_left, below, below_right) = unsafe {
+            (
+                box_at(grid, has_right, x + 1, y),
+                box_at(grid, has_left & has_below, x.wrapping_sub(1), y + 1),
+                box_at(grid, has_below, x, y + 1),
+                box_at(grid, has_right & has_below, x + 1, y + 1),
+            )
+        };
+        // The sides that face the cell: how far each neighbor's items reach
+        // towards it.
+        let (right, below) = (right.min_x, below.min_y);
+        let below_left = [below_left.max_x, below_left.min_y];
+        let below_right = [below_right.min_x, below_right.min_y];
+        for (index, entry) in node.items.iter().enumerate() {
+            let bounds = &entry.bounds;
+            if SELF_QUERY && bounds.intersects(bounds) {
+                callback(entry.item, entry.item);
+            }
+            let mut report = |found| {
+                callback(entry.item, found);
+                if SELF_QUERY {
+                    callback(found, entry.item);
+                }
+            };
+            // All four are computed up front, as in `walk_3x3_by_copies`.
+            let after = bounds.max_x > right;
+            let down = bounds.max_y > below;
+            let down_before = (bounds.min_x < below_left[0]) & (bounds.max_y > below_left[1]);
+            let down_after = (bounds.max_x > below_right[0]) & (bounds.max_y > below_right[1]);
+            node.pair_with_after(index, bounds, &mut report);
+            // SAFETY: the box of a missing neighbor is `EMPTY`, which fails
+            // every comparison above, so each cell read here exists.
+            unsafe {
+                if after {
+                    grid.get_unchecked(y, x + 1).pair_with(bounds, &mut report);
+                }
+                if down_before {
+                    grid.get_unchecked(y + 1, x - 1)
+                        .pair_with(bounds, &mut report);
+                }
+                if down {
+                    grid.get_unchecked(y + 1, x).pair_with(bounds, &mut report);
+                }
+                if down_after {
+                    grid.get_unchecked(y + 1, x + 1)
+                        .pair_with(bounds, &mut report);
+                }
+            }
         }
     }
 
@@ -550,77 +669,6 @@ impl<T: Copy> HaloGrid<T> {
     /// Visit the cell of the query's center and each neighbor whose items may
     /// reach the query, judged by the cell's copies, or, while those may be
     /// behind the boxes, by the spans. For queries no larger than a cell.
-    #[inline]
-    /// Search the half stencil of [`for_each_pair`]: cell `(x, y)` after its
-    /// item `start`, and of the neighbors after it in row-major order those
-    /// that `walk_3x3` would visit for `bounds`, by the copies or, next to a
-    /// changed cell of a stale grid, by the spans.
-    ///
-    /// [`for_each_pair`]: Self::for_each_pair
-    fn pair_half_stencil(
-        &self,
-        (x, y): (usize, usize),
-        start: usize,
-        bounds: &Rectangle,
-        callback: &mut impl FnMut(T),
-    ) {
-        if self.lines.stale && self.after_changed((x, y)) {
-            let grid = &self.cells;
-            let lines = &self.lines;
-            let (cols, rows) = (grid.cols(), grid.rows());
-            // SAFETY: `(x, y)` is a cell, the clamped line indices are in bounds,
-            // and each neighbor is read only after the test that it exists.
-            unsafe {
-                let below = lines.rows.get_unchecked((y + 1).min(rows - 1))[0];
-                let left_of = lines.columns.get_unchecked(x.saturating_sub(1))[1];
-                let right_of = lines.columns.get_unchecked((x + 1).min(cols - 1))[0];
-                let down = (y + 1 != rows) & (bounds.max_y > below);
-                let before = (x != 0) & (bounds.min_x < left_of);
-                let after = (x + 1 != cols) & (bounds.max_x > right_of);
-                grid.get_unchecked(y, x)
-                    .pair_with_after(start, bounds, callback);
-                if after {
-                    grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
-                }
-                if down {
-                    if before {
-                        grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
-                    }
-                    grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
-                    if after {
-                        grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
-                    }
-                }
-            }
-        } else {
-            let grid = &self.cells;
-            // SAFETY: as in `walk_3x3_by_copies`.
-            unsafe {
-                let halo = self.halo.get_unchecked(y * grid.cols() + x);
-                let after = bounds.max_x > halo.right;
-                let down = bounds.max_y > halo.bottom;
-                let down_before =
-                    (bounds.min_x < halo.bottom_left[0]) & (bounds.max_y > halo.bottom_left[1]);
-                let down_after =
-                    (bounds.max_x > halo.bottom_right[0]) & (bounds.max_y > halo.bottom_right[1]);
-                grid.get_unchecked(y, x)
-                    .pair_with_after(start, bounds, callback);
-                if after {
-                    grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
-                }
-                if down_before {
-                    grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
-                }
-                if down {
-                    grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
-                }
-                if down_after {
-                    grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
-                }
-            }
-        }
-    }
-
     fn walk_3x3<'a>(&'a self, bounds: &Rectangle, visit: impl FnMut(&'a Node<T>)) {
         let (x, y) = self.cell_containing(bounds.get_center());
         // Copies can be behind only after a store, and then only next to the
@@ -636,6 +684,9 @@ impl<T: Copy> HaloGrid<T> {
     /// the boxes they stand for.
     #[inline(always)]
     fn around_changed(&self, (x, y): (usize, usize)) -> bool {
+        if self.copies_behind {
+            return true;
+        }
         if self.dense_marks {
             return self.lines.near_touched(y);
         }
@@ -643,19 +694,6 @@ impl<T: Copy> HaloGrid<T> {
         debug_assert!(x < size.0 && y < size.1);
         // SAFETY: the walks stay in the grid, so `(x, y)` is one of its cells.
         unsafe { self.marks.any_around((x, y), size) }
-    }
-
-    /// [`around_changed`](Self::around_changed) for the half stencil of the
-    /// pair queries.
-    #[inline(always)]
-    fn after_changed(&self, (x, y): (usize, usize)) -> bool {
-        if self.dense_marks {
-            return self.lines.near_touched(y);
-        }
-        let size = (self.cells.cols(), self.cells.rows());
-        debug_assert!(x < size.0 && y < size.1);
-        // SAFETY: the pair walk visits only cells of the grid.
-        unsafe { self.marks.any_after((x, y), size) }
     }
 
     /// Visit cell `(x, y)` and those of its eight neighbors whose copies in
@@ -904,7 +942,8 @@ struct LineSpan {
     /// An item was stored since the last refresh, so a box may have grown
     /// past the copies of its sides held by the neighbors: until the
     /// refresh, the walk judges the neighbors of a query cell next to a
-    /// changed cell by the spans instead.
+    /// changed cell by the spans instead. Also set where a refresh for pairs
+    /// left the copies behind.
     stale: bool,
     row_touched: Box<[bool]>,
 }
@@ -1251,6 +1290,79 @@ mod tests {
                     expected_copies(tree, x, y),
                     "{context}, cell ({x}, {y})"
                 );
+            }
+        }
+    }
+
+    /// The same moves go to two grids, one refreshed for pairs, one fully.
+    /// After every refresh the boxes and spans of the two agree, also when a
+    /// second refresh for pairs follows with nothing changed, and searches
+    /// find the same items in both. A full refresh
+    /// of the first, with or without moves since its last refresh for pairs,
+    /// then leaves it as if it had never skipped the copies. Bursts of moves
+    /// alternate with a few, so that refreshes both sweep the rows and visit
+    /// the marked cells.
+    #[test]
+    fn a_full_refresh_restores_the_copies_after_refreshes_for_pairs() {
+        let mut rng = StdRng::seed_from_u64(31);
+        for world in WORLDS {
+            let cell = 64.0;
+            let (mut pairs, mut full) = (
+                Tree::new(world.clone(), cell),
+                Tree::new(world.clone(), cell),
+            );
+            let mut items: Vec<[ItemHandle; 2]> = Vec::new();
+            for id in 0..500 {
+                let bounds = random_bounds(&mut rng, &world, cell);
+                items.push([pairs.insert(bounds.clone(), id), full.insert(bounds, id)]);
+            }
+            pairs.refresh_bounds();
+            full.refresh_bounds();
+            let moves = |rng: &mut StdRng, pairs: &mut Tree, full: &mut Tree, count: usize| {
+                for _ in 0..count {
+                    let [a, b] = items[rng.gen_range(0..items.len())];
+                    let bounds = random_bounds(rng, &world, cell);
+                    pairs.update(bounds.clone(), a);
+                    full.update(bounds, b);
+                }
+            };
+            for round in 0..40 {
+                let context = format!("{world:?}, round {round}");
+                let count = if round % 3 == 0 { 300 } else { 3 };
+                moves(&mut rng, &mut pairs, &mut full, count);
+                pairs.refresh_for_pairs();
+                if round % 2 == 1 {
+                    pairs.refresh_for_pairs();
+                }
+                full.refresh_bounds();
+                let boxes = |tree: &Tree| -> Vec<Rectangle> {
+                    tree.cells.iter().map(|cell| cell.bounds.clone()).collect()
+                };
+                assert_eq!(boxes(&pairs), boxes(&full), "{context}");
+                assert_eq!(pairs.lines.columns, full.lines.columns, "{context}");
+                assert_eq!(pairs.lines.rows, full.lines.rows, "{context}");
+                let found = |tree: &Tree, query: &Rectangle| {
+                    let mut found = Vec::new();
+                    tree.search(query, |id| found.push(id));
+                    found.sort_unstable();
+                    found
+                };
+                for _ in 0..100 {
+                    let query = random_bounds(&mut rng, &world, cell);
+                    assert_eq!(
+                        found(&pairs, &query),
+                        found(&full, &query),
+                        "{context}, {query:?}"
+                    );
+                }
+                if round % 5 == 4 {
+                    if round % 10 == 9 {
+                        moves(&mut rng, &mut pairs, &mut full, 3);
+                        full.refresh_bounds();
+                    }
+                    pairs.refresh_bounds();
+                    assert_refreshed(&pairs, &context);
+                }
             }
         }
     }

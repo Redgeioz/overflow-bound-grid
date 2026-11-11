@@ -81,15 +81,21 @@ pub trait QTree<T> {
     /// the end of a frame, so that lazy structures bring their bounds up to
     /// date.
     fn end_frame(&mut self) {}
+    /// `end_frame` before a benchmark that asks only for pairs.
+    #[allow(dead_code, reason = "unused by the update benchmarks")]
+    fn end_frame_for_pairs(&mut self) {
+        self.end_frame();
+    }
     /// Pass every item whose bounds meet `bounds` to `callback`.
     #[allow(dead_code, reason = "unused by the update benchmarks")]
     fn search_items(&self, bounds: &Rectangle, callback: impl FnMut(T));
 }
 
 /// Implements [`QTree`] for `$tree`, whose parameters after the item type are
-/// `$param`; given `$end_frame`, `end_frame` calls that method.
+/// `$param`; given `$end_frame`, `end_frame` calls that method, and given
+/// `$for_pairs`, `end_frame_for_pairs` calls that one.
 macro_rules! qtree {
-    ($tree:ident<T $(, const $param:ident: $kind:ty)*> $(, $end_frame:ident)?) => {
+    ($tree:ident<T $(, const $param:ident: $kind:ty)*> $(, $end_frame:ident $(, $for_pairs:ident)?)?) => {
         impl<T: Copy $(, const $param: $kind)*> QTree<T> for $tree<T $(, $param)*> {
             fn insert_item(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
                 self.insert(bounds, item)
@@ -104,6 +110,11 @@ macro_rules! qtree {
                 fn end_frame(&mut self) {
                     self.$end_frame();
                 }
+                $(
+                    fn end_frame_for_pairs(&mut self) {
+                        self.$for_pairs();
+                    }
+                )?
             )?
             // Copied into each caller, like a closure of the benchmark's own,
             // so that the timed loops can inline it.
@@ -121,12 +132,12 @@ qtree!(ExactOverflowBoundGrid<T, const MAX_LEVEL: u8>);
 qtree!(BoxedLooseGrid<T, const MAX_LEVEL: u8>, refresh_bounds);
 qtree!(LazyOverflowBoundGrid<T, const MAX_LEVEL: u8>, refresh_bounds);
 qtree!(SpanOverflowBoundGrid<T, const MAX_LEVEL: u8>, refresh_bounds);
-qtree!(HaloOverflowBoundGrid<T, const MAX_LEVEL: u8>, refresh_bounds);
+qtree!(HaloOverflowBoundGrid<T, const MAX_LEVEL: u8>, refresh_bounds, refresh_for_pairs);
 qtree!(UniformGrid<T>);
 qtree!(TwoLayerGrid<T>);
 qtree!(MultiGrid<T>);
 qtree!(SpanGrid<T>, refresh_bounds);
-qtree!(HaloGrid<T>, refresh_bounds);
+qtree!(HaloGrid<T>, refresh_bounds, refresh_for_pairs);
 qtree!(SortAndSweep<T>, refresh_order);
 
 /// [`SortAndSweep`] that never refreshes its order, so that every pair query

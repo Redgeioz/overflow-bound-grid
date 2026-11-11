@@ -421,7 +421,7 @@ impl<T: Copy> SpanGrid<T> {
     /// bounds intersect, with the two items in either order. An item in a
     /// cell reads only the items after it in its cell and the cells after its
     /// own in row-major order, that is the neighbor to the right and those in
-    /// the row below, where a search with its bounds would read them. The
+    /// the row below, each only if its box reaches the item. The
     /// items of the overflow node pair up with the overflow items after them
     /// and scan every cell within half a cell of their bounds, as a search with
     /// bounds larger than a cell does, so a pair of a cell item and an overflow
@@ -447,17 +447,8 @@ impl<T: Copy> SpanGrid<T> {
     fn pair_walk<const SELF_QUERY: bool>(&self, mut callback: impl FnMut(T, T)) {
         let cells = &self.cells;
         for_each_cell_in_morton_order(cells.cols(), cells.rows(), |x, y| {
-            for (index, entry) in cells[y][x].items.iter().enumerate() {
-                if SELF_QUERY && entry.bounds.intersects(&entry.bounds) {
-                    callback(entry.item, entry.item);
-                }
-                let mut report = |found| {
-                    callback(entry.item, found);
-                    if SELF_QUERY {
-                        callback(found, entry.item);
-                    }
-                };
-                self.pair_half_stencil((x, y), index, &entry.bounds, &mut report);
+            if !cells[y][x].items.is_empty() {
+                self.pair_cell::<SELF_QUERY>((x, y), &mut callback);
             }
         });
         for (index, entry) in self.overflow.items.iter().enumerate() {
@@ -476,6 +467,87 @@ impl<T: Copy> SpanGrid<T> {
         }
     }
 
+    /// The pair walk at cell `(x, y)`, which holds items: each item with the
+    /// items after it in the cell and with those of the four neighbors after
+    /// the cell in row-major order whose boxes reach it.
+    ///
+    /// The four neighbors are judged by their own boxes as they are now, read
+    /// once for the cell, as in [`HaloGrid`](crate::HaloGrid): a box covers
+    /// its items at all times, so the tests hold before a refresh as well.
+    /// Judging each item by the spans of the neighbors' columns and row
+    /// instead, as `search_3x3` does, with each box left to the read of its
+    /// cell, the pair query took 1.20 to 1.21 times as long on the mixed
+    /// distribution with 312.5-unit cells, 1.23 to 1.27 times with 32 balls
+    /// to a cell, and 1.21 to 1.24 times with 500 to 2,000 balls on 128 by
+    /// 128 cells, on a Core Ultra 9 275HX with rustc 1.99
+    /// (`bench-results/r1-port-2026-11-10.md`).
+    ///
+    /// Not inlined: inlined into the walk it measured 3% slower on the mixed
+    /// distribution, 11% slower with 32 balls to a cell, and took 1.3 to 1.8
+    /// times as long with 500 to 2,000 balls on 128 by 128 cells.
+    #[inline(never)]
+    fn pair_cell<const SELF_QUERY: bool>(
+        &self,
+        (x, y): (usize, usize),
+        callback: &mut impl FnMut(T, T),
+    ) {
+        let grid = &self.cells;
+        let node = &grid[y][x];
+        let (has_left, has_right) = (x > 0, x + 1 < grid.cols());
+        let has_below = y + 1 < grid.rows();
+        // SAFETY: `(x, y)` is a cell of `grid`, and a neighbor is read only
+        // if the grid has it.
+        let (right, below_left, below, below_right) = unsafe {
+            (
+                box_at(grid, has_right, x + 1, y),
+                box_at(grid, has_left & has_below, x.wrapping_sub(1), y + 1),
+                box_at(grid, has_below, x, y + 1),
+                box_at(grid, has_right & has_below, x + 1, y + 1),
+            )
+        };
+        // The sides that face the cell: how far each neighbor's items reach
+        // towards it.
+        let (right, below) = (right.min_x, below.min_y);
+        let below_left = [below_left.max_x, below_left.min_y];
+        let below_right = [below_right.min_x, below_right.min_y];
+        for (index, entry) in node.items.iter().enumerate() {
+            let bounds = &entry.bounds;
+            if SELF_QUERY && bounds.intersects(bounds) {
+                callback(entry.item, entry.item);
+            }
+            let mut report = |found| {
+                callback(entry.item, found);
+                if SELF_QUERY {
+                    callback(found, entry.item);
+                }
+            };
+            // All four are computed before the first neighbor is read.
+            let after = bounds.max_x > right;
+            let down = bounds.max_y > below;
+            let down_before = (bounds.min_x < below_left[0]) & (bounds.max_y > below_left[1]);
+            let down_after = (bounds.max_x > below_right[0]) & (bounds.max_y > below_right[1]);
+            node.pair_with_after(index, bounds, &mut report);
+            // SAFETY: the box of a missing neighbor is `EMPTY`, which fails
+            // every comparison above, so each cell read here exists.
+            unsafe {
+                if after {
+                    grid.get_unchecked(y, x + 1).pair_with(bounds, &mut report);
+                }
+                if down_before {
+                    grid.get_unchecked(y + 1, x - 1)
+                        .pair_with(bounds, &mut report);
+                }
+                if down {
+                    grid.get_unchecked(y + 1, x).pair_with(bounds, &mut report);
+                }
+                if down_after {
+                    grid.get_unchecked(y + 1, x + 1)
+                        .pair_with(bounds, &mut report);
+                }
+            }
+        }
+    }
+
     /// Search the grid and execute the callback for each item whose bounds
     /// intersect `bounds`.
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
@@ -491,47 +563,6 @@ impl<T: Copy> SpanGrid<T> {
             self.scan(bounds, &mut callback);
         }
         self.overflow.search_items(bounds, &mut callback);
-    }
-
-    /// Search the half stencil of [`for_each_pair`]: cell `(x, y)` after its
-    /// item `start`, and of the neighbors after it in row-major order those
-    /// whose spans meet `bounds`, by the tests of `search_3x3`.
-    ///
-    /// [`for_each_pair`]: Self::for_each_pair
-    fn pair_half_stencil(
-        &self,
-        (x, y): (usize, usize),
-        start: usize,
-        bounds: &Rectangle,
-        callback: &mut impl FnMut(T),
-    ) {
-        let grid = &self.cells;
-        let lines = &self.lines;
-        let (cols, rows) = (grid.cols(), grid.rows());
-        // SAFETY: `(x, y)` is a cell, the clamped line indices are in bounds,
-        // and each neighbor is read only after the test that it exists.
-        unsafe {
-            let below = lines.rows.get_unchecked((y + 1).min(rows - 1))[0];
-            let left_of = lines.columns.get_unchecked(x.saturating_sub(1))[1];
-            let right_of = lines.columns.get_unchecked((x + 1).min(cols - 1))[0];
-            let down = (y + 1 != rows) & (bounds.max_y > below);
-            let before = (x != 0) & (bounds.min_x < left_of);
-            let after = (x + 1 != cols) & (bounds.max_x > right_of);
-            grid.get_unchecked(y, x)
-                .pair_with_after(start, bounds, callback);
-            if after {
-                grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
-            }
-            if down {
-                if before {
-                    grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
-                }
-                grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
-                if after {
-                    grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
-                }
-            }
-        }
     }
 
     /// Search the cell of the query's center and each neighbor whose column
@@ -763,6 +794,20 @@ impl LineSpan {
         let column = &mut self.columns[x];
         column[0] = lower(column[0], bounds.min_x);
         column[1] = higher(column[1], bounds.max_x);
+    }
+}
+
+/// Box of cell `(x, y)` of `grid` if `present`, else [`EMPTY`].
+///
+/// # Safety
+///
+/// `(x, y)` must be a cell of `grid` when `present`.
+#[inline(always)]
+unsafe fn box_at<T: Copy>(grid: &Grid<Node<T>>, present: bool, x: usize, y: usize) -> &Rectangle {
+    if present {
+        unsafe { &grid.get_unchecked(y, x).bounds }
+    } else {
+        &EMPTY
     }
 }
 

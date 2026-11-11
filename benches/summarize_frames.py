@@ -4,12 +4,14 @@
 
 Per mode and scene, every structure's median over its runs (rounds and
 seeds) of the mean time per frame, split into update (moves, updates and the
-end of the frame) and queries. The ratio to BASELINE (HaloOverflowBoundGrid
-by default) is the median of the ratios of runs with the same seed and round
-of the same invocation of run_frames.sh (or, for lines without an
-invocation id, the same sources, warmup and frames), so that seeds with more
-work do not mix into it; a baseline run that would pair ambiguously is
-reported and left out. Also the spread of the runs,
+end of the frame) and queries. The scenes of mixed sizes and the scene of
+small items (`small`) are listed apart and never compared. The ratio to
+BASELINE (by default HaloOverflowBoundGrid, and HaloGrid in `small`, where
+the first does not run) is the median of the ratios of runs with the same
+seed and round of the same invocation of run_frames.sh (or, for lines
+without an invocation id, the same sources, warmup and frames), so that
+seeds with more work do not mix into it; a baseline run that would pair
+ambiguously is reported and left out. Also the spread of the runs,
 the share of items maintained per frame, the heap the structure holds after
 setup and at the end of the run, and the allocations per timed frame. Lines
 with a "build" field are kept apart per build. Checksums must agree across
@@ -24,6 +26,12 @@ from collections import defaultdict
 
 # The µ of the headers on consoles of other code pages.
 sys.stdout.reconfigure(encoding="utf-8")
+
+
+# Scenes whose items never double in size; all others mix sizes.
+SMALL_SCENES = {"small"}
+# Ratio baselines other than HaloOverflowBoundGrid, by scene.
+SCENE_BASELINES = {"small": "HaloGrid"}
 
 
 def scene(run):
@@ -46,7 +54,8 @@ def label(run):
 
 def main():
     path = sys.argv[1]
-    baseline = sys.argv[2] if len(sys.argv) > 2 else "HaloOverflowBoundGrid"
+    chosen = sys.argv[2] if len(sys.argv) > 2 else None
+    baseline_of = lambda name: chosen or SCENE_BASELINES.get(name, "HaloOverflowBoundGrid")
     runs = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
 
     checksums = defaultdict(set)
@@ -61,7 +70,7 @@ def main():
     bases = {}
     ambiguous = set()
     for run in runs:
-        if run["structure"] == baseline:
+        if run["structure"] == baseline_of(run["scene"]):
             key = (run["mode"], scene(run), run["seed"], run.get("round"), run.get("build"), run.get("pool"), batch(run))
             if key in bases:
                 ambiguous.add(key)
@@ -74,7 +83,16 @@ def main():
     for run in runs:
         groups[(run["mode"], scene(run))].append(run)
 
-    for (mode, scene_name), group in sorted(groups.items(), key=lambda item: (item[0][1], item[0][0])):
+    section = None
+    order = lambda item: (item[0][1].split(",")[0] in SMALL_SCENES, item[0][1], item[0][0])
+    for (mode, scene_name), group in sorted(groups.items(), key=order):
+        base_scene = scene_name.split(",")[0]
+        small = base_scene in SMALL_SCENES
+        if small != section:
+            section = small
+            print("\n## Frames, small items (radii 25 to 50, never doubled)" if small
+                  else "\n## Frames, mixed sizes (radii 25 to 50, doubled up to five times)")
+        baseline = baseline_of(base_scene)
         by_structure = defaultdict(list)
         for run in group:
             by_structure[label(run)].append(run)
@@ -108,7 +126,7 @@ def main():
                 "runs": len(items),
             })
         rows.sort(key=lambda row: row["frame"])
-        unit, scale, digits = ("µs", 1.0, 0) if scene_name.startswith("10k") else ("ms", 1e-3, 2)
+        unit, scale, digits = ("µs", 1.0, 0) if base_scene in ("10k", "small") else ("ms", 1e-3, 2)
         fmt = lambda value: f"{value * scale:.{digits}f}"
         print(f"\n### {mode}, {scene_name}\n")
         print(f"| structure | frame ({unit}) | vs {baseline} (paired) | update | query | runs, range "

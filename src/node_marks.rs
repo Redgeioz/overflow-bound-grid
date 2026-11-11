@@ -238,27 +238,6 @@ impl NodeMarks {
             != 0
     }
 
-    /// Whether the east, south-west, south or south-east neighbor of `(x, y)`
-    /// is marked, the four that a pair query reads, with the clamping of
-    /// [`any_around`](Self::any_around).
-    ///
-    /// # Safety
-    ///
-    /// As for [`any_around`](Self::any_around).
-    #[inline(never)]
-    pub(crate) unsafe fn any_after(
-        &self,
-        (x, y): (usize, usize),
-        (cols, rows): (usize, usize),
-    ) -> bool {
-        let (left, right) = (x.saturating_sub(1), (x + 1).min(cols - 1));
-        let middle = y * self.stride;
-        let below = (y + 1).min(rows - 1) * self.stride;
-        // SAFETY: as in `any_around`.
-        let at = |row: usize, column: usize| unsafe { *self.nodes.get_unchecked(row + column) };
-        (at(middle, right) | at(below, left) | at(below, x) | at(below, right)) != 0
-    }
-
     /// Clear every mark; the count of occupied nodes stays.
     pub(crate) fn clear(&mut self) {
         self.nodes.fill(0);

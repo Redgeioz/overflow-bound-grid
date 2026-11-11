@@ -110,8 +110,8 @@ pub(crate) struct LayerGeometry {
     /// Centers relative to the root origin that the update shortcut accepts
     /// for each cell along each axis: cell `i` takes the half-open interval
     /// `ranges[2 * i]..ranges[2 * i + 1]`, its own without [`reach_margin`] at
-    /// both ends, except for the outer end of the first. Empty on the root and
-    /// on degenerate levels, which disables the update shortcut.
+    /// both ends, except for the outer end of the first. Empty on the root,
+    /// which disables the update shortcut.
     ///
     /// Boxed slices keep the struct at 72 bytes; `Vec`s make it 88 bytes,
     /// which measured `search` a few percent slower.
@@ -122,18 +122,11 @@ pub(crate) struct LayerGeometry {
 impl LayerGeometry {
     /// Geometry of `level`, whose grid has `cols` by `rows` cells.
     pub(crate) fn new(root_bounds: &Rectangle, level: usize, cols: usize, rows: usize) -> Self {
-        let root_width = root_bounds.get_width();
-        let root_height = root_bounds.get_height();
         let (node_width, node_height) = Self::node_size(root_bounds, cols, rows);
 
-        // Root items may come from outside the world, and degenerate or
-        // subnormal sizes break the exactness `matches_layer` relies on; both
-        // cases keep full positioning.
-        let is_root = level == 1;
-        let sizes_are_usable = [root_width, root_height, node_width, node_height]
-            .into_iter()
-            .all(|size| size.is_normal() && size > 0.0);
-        if is_root || !sizes_are_usable {
+        // Root items may come from outside the world and keep full
+        // positioning.
+        if level == 1 {
             return Self {
                 node_width,
                 node_height,
@@ -156,12 +149,22 @@ impl LayerGeometry {
     /// Node size of a level whose grid has `cols` by `rows` cells: the root
     /// size divided by the larger count, as a grid trimmed to a non-square
     /// world keeps the cell size of the full square grid.
+    ///
+    /// Panics unless both are normal floats, which also rules out the zero of
+    /// a root too far from the origin to keep any size. Below them the
+    /// reciprocal, or twice it, which [`half_node_corners`] and
+    /// [`within_reach`] multiply by, comes out infinite: positions and scans
+    /// collapse onto the first and last nodes, and queries both miss items and
+    /// report ones they do not meet.
     pub(crate) fn node_size(root_bounds: &Rectangle, cols: usize, rows: usize) -> (f64, f64) {
         let cells_per_axis = cols.max(rows) as f64;
-        (
-            root_bounds.get_width() / cells_per_axis,
-            root_bounds.get_height() / cells_per_axis,
-        )
+        let width = root_bounds.get_width() / cells_per_axis;
+        let height = root_bounds.get_height() / cells_per_axis;
+        assert!(
+            width.is_normal() && height.is_normal(),
+            "Nodes need a normal size; the world or cell is too small, or too far from the origin."
+        );
+        (width, height)
     }
 
     // The predicates below are not generic but run inside generic tree
@@ -258,10 +261,14 @@ pub(crate) struct Levels<N> {
 
 /// The levels of a multi-level grid over `world_bounds`, with nodes made by
 /// `node`. Unless `FIT`, the root is a square from the world's minimum corner,
-/// and each level keeps only the rows or columns that cover the world.
+/// and each level keeps only the rows or columns that cover the world: the
+/// finest level those that the world's shorter side spans, and every coarser
+/// level half as many, rounded up, so that every node has its parent. The
+/// walks step from a node to its parent and read it unchecked.
 ///
-/// Panics if `max_level` is zero or the finest level has more cells than
-/// `usize` counts.
+/// Panics if `max_level` is zero, if the finest level has more cells than
+/// `usize` counts, unless the world's width and height are positive and
+/// finite, or if [`LayerGeometry::node_size`] rejects the nodes of a level.
 pub(crate) fn build_levels<N, const FIT: bool>(
     world_bounds: &Rectangle,
     max_level: u8,
@@ -278,23 +285,45 @@ pub(crate) fn build_levels<N, const FIT: bool>(
 
     let world_width = world_bounds.get_width();
     let world_height = world_bounds.get_height();
+    // A world without width or height would leave the trimmed levels without
+    // columns or rows, and the walks and scans, which clamp to the last node
+    // of a level and read it unchecked, without a node to read.
+    assert!(
+        world_width > 0.0
+            && world_height > 0.0
+            && world_width.is_finite()
+            && world_height.is_finite(),
+        "The world must have a positive, finite width and height."
+    );
+
+    let (mut finest_rows, mut finest_cols) = (n, n);
+    if !FIT {
+        if world_width > world_height {
+            finest_rows = trimmed_lines(n as f64 * world_height / world_width, n);
+        } else if world_height > world_width {
+            finest_cols = trimmed_lines(n as f64 / world_height * world_width, n);
+        }
+    }
 
     let mut layers = Vec::with_capacity(max_level as usize + 1);
-    let mut size = 0;
     for level in 0..=max_level {
-        let (mut rows, mut cols) = (size, size);
-        if !FIT {
-            if world_width > world_height {
-                rows = (size as f64 * world_height / world_width).ceil() as usize;
-            } else if world_height > world_width {
-                cols = (size as f64 / world_height * world_width).ceil() as usize;
-            }
-        }
+        // Level zero has no nodes. A node of any other level stands for
+        // `span` rows and columns of the finest level, the last node of a row
+        // or column for those left over, so every node has a parent. The
+        // quotient of each level's own size gives the same counts as long as
+        // nothing overflows or underflows on the way; a product that
+        // overflows only from some level on would leave the finer levels
+        // with rows or columns that have no parent.
+        let (rows, cols) = if level == 0 {
+            (0, 0)
+        } else {
+            let span = 1usize << (max_level - level);
+            (finest_rows.div_ceil(span), finest_cols.div_ceil(span))
+        };
         layers.push(Grid::from_vec(
             (0..rows * cols).map(|_| node()).collect(),
             cols,
         ));
-        size = 1 << level;
     }
 
     let root_bounds = if !FIT {
@@ -330,6 +359,17 @@ pub(crate) fn build_levels<N, const FIT: bool>(
         inverse_node_size,
         size_root,
     }
+}
+
+/// Rows or columns that the finest level, of `size` nodes per axis, keeps
+/// along the shorter side of the world, which spans `lines` of them: that
+/// rounded up, and at least one and at most all. The limits apply only
+/// where the arithmetic gave out: a quotient that underflowed to zero, as
+/// for a world `1e300` wide and `1e-300` high, would leave the level without
+/// nodes, and one whose product overflowed, as for a world `2^1023` wide and
+/// `2^1022` high, comes out infinite.
+fn trimmed_lines(lines: f64, size: usize) -> usize {
+    (lines.ceil() as usize).clamp(1, size)
 }
 
 /// The level an item of extent `size` along one axis of a root of extent
@@ -485,6 +525,124 @@ mod tests {
     /// The definition `size_level` must reproduce.
     fn by_division(root: f64, size: f64) -> i64 {
         (usize::BITS - ((root / size) as usize).leading_zeros()) as i64
+    }
+
+    /// `(rows, columns)` of every level of the unfitted grid over `world`.
+    fn shapes(world: &Rectangle, max_level: u8) -> Vec<(usize, usize)> {
+        build_levels::<u8, false>(world, max_level, || 0)
+            .layers
+            .iter()
+            .map(|grid| (grid.rows(), grid.cols()))
+            .collect()
+    }
+
+    /// The trimmed levels have the rows and columns that the quotient of each
+    /// level's own size gives, as before they followed from the finest level:
+    /// for the worlds of the tests and benches, for sides whose quotients
+    /// are whole or half numbers of nodes on some level, a float to either
+    /// side of those, and for random sides.
+    #[test]
+    fn levels_keep_the_rows_and_columns_of_their_own_quotient() {
+        let mut rng = StdRng::seed_from_u64(41);
+        let mut sides = vec![
+            (20000.0, 20000.0),
+            (80000.0, 80000.0),
+            (20000.0, 80000.0),
+            (20000.0, 320000.0),
+            (1024.0, 512.0),
+            (999.8, 334.0),
+            (300.0, 1300.0),
+            (1000.0, 300.0),
+        ];
+        for _ in 0..20_000 {
+            let long = 2f64.powf(rng.gen_range(-30.0..30.0));
+            let short = match rng.gen_range(0..3) {
+                // A whole number of sixty-fourths of the longer side.
+                0 => long * rng.gen_range(1..64) as f64 / 64.0,
+                1 => long * rng.gen_range(1..1024) as f64 / 1024.0,
+                _ => long * 2f64.powf(rng.gen_range(-12.0..0.0)),
+            };
+            let short = match rng.gen_range(0..4) {
+                0 => short.next_up(),
+                1 => short.next_down(),
+                _ => short,
+            };
+            sides.push(if rng.gen_bool(0.5) {
+                (long, short)
+            } else {
+                (short, long)
+            });
+        }
+        for (index, &(width, height)) in sides.iter().enumerate() {
+            // Eleven levels, whose finest has a million nodes, for a few.
+            let most = if index < 300 { 11 } else { 7 };
+            for max_level in [1u8, 2, 7, most] {
+                let world = Rectangle::new(0.0, 0.0, width, height);
+                let levels = shapes(&world, max_level);
+                assert_eq!(levels[0], (0, 0));
+                for level in 1..=max_level as usize {
+                    let size = 1usize << (level - 1);
+                    let (mut rows, mut cols) = (size, size);
+                    if width > height {
+                        rows = (size as f64 * height / width).ceil() as usize;
+                    } else if height > width {
+                        cols = (size as f64 / height * width).ceil() as usize;
+                    }
+                    assert_eq!(
+                        levels[level],
+                        (rows, cols),
+                        "level {level} of {max_level}, {width:e} by {height:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every level below level zero has rows and columns, at most those of
+    /// the full square and all of them along one axis, and half as many as
+    /// the next finer level, rounded up, so that every node has a parent:
+    /// also over worlds whose shorter side spans a number of rows or columns
+    /// that underflows to zero, or whose product overflows from some level on.
+    #[test]
+    fn every_level_has_nodes_and_every_node_a_parent() {
+        let huge = 2f64.powi(1023);
+        let sides = [
+            (1000.0, 300.0),
+            (300.0, 1300.0),
+            (512.0, 512.0),
+            // The quotient underflows to zero.
+            (1e200, 1e-200),
+            (1e-200, 1e200),
+            (f64::MAX, f64::MIN_POSITIVE),
+            (5e-324, f64::MAX),
+            // `size * height` overflows from the third level on.
+            (huge, huge / 2.0),
+            (huge / 2.0, huge),
+            (f64::MAX, f64::MAX / 3.0),
+        ];
+        for max_level in [1u8, 2, 3, 7, 10] {
+            for (width, height) in sides {
+                let world = Rectangle::new(0.0, 0.0, width, height);
+                let levels = shapes(&world, max_level);
+                let context = format!("{max_level} levels, {width:e} by {height:e}");
+                assert_eq!(levels[0], (0, 0), "{context}");
+                for level in 1..=max_level as usize {
+                    let size = 1usize << (level - 1);
+                    let (rows, cols) = levels[level];
+                    assert!(
+                        rows >= 1 && cols >= 1 && rows.max(cols) == size,
+                        "{context}: level {level} is {cols} by {rows}"
+                    );
+                    if level > 1 {
+                        assert_eq!(
+                            levels[level - 1],
+                            (rows.div_ceil(2), cols.div_ceil(2)),
+                            "{context}: the parents of level {level}, {cols} by {rows}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Up to `count` floats on either side of `value`, and `value` itself.

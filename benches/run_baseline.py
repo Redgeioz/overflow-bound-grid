@@ -54,11 +54,13 @@ QUIET_WAIT_S = 180
 
 def structures(scene, mode, share):
     """The structures of a cell of the frame matrix."""
-    names = [HALO, "SpanOverflowBoundGrid", "HierarchicalLooseGrid", "UniformGrid", "TwoLayerGrid", "ParryRaw/opt-refit"]
-    if scene == "10k":
-        # Single-level grids, whose larger items would all share the overflow
-        # node in the mixed distribution of the large scene.
-        names += ["HaloGrid", "SpanGrid"]
+    if scene == "small":
+        # Items that all fit a cell, so the single-level grids, which the
+        # mixed sizes would leave with crowded overflow nodes, against each
+        # other; `MultiGrid/1` is a loose grid without bounds.
+        return ["HaloGrid", "SpanGrid", "UniformGrid", "TwoLayerGrid", "MultiGrid/1"]
+    names = [HALO, "SpanOverflowBoundGrid", "HierarchicalLooseGrid", "BoxedLooseGrid", "UniformGrid", "TwoLayerGrid",
+             "ParryRaw/opt-refit"]
     if mode == "search":
         return names + ["PackedRTree/static-hilbert-coherent"]
     names += ["SortAndSweep", "PackedRTree/static-hilbert-join-coherent"]
@@ -78,14 +80,18 @@ def frame_cells():
         for mode in ("pairs", "search"):
             for share in SHARES:
                 cells.append((scene, mode, share, structures(scene, mode, share), SEEDS, ROUNDS))
+    # The small items, region queries only: what Halo's copies are for. Pairs
+    # gain more from the handling of the bounds than from the copies.
+    for share in SHARES:
+        cells.append(("small", "search", share, structures("small", "search", share), SEEDS, ROUNDS))
     # Controls of the reports, once each per seed 0: the adapters as a library's
     # user would drive them, and the sweep with an index in y.
     for scene in ("10k", "160k"):
         cells.append((scene, "pairs", "1", ["ParryBvh/opt-refit", "PackedRTree/static-hilbert", "SpatialJoinSweep/kept-vec"], (0,), ROUNDS))
         cells.append((scene, "search", "1", ["ParryBvh/opt-refit", "PackedRTree/static-hilbert"], (0,), ROUNDS))
-    # Worlds taller than wide, at the same density and finest cell width.
-    for scene in ("tall4", "tall16"):
-        cells.append((scene, "pairs", "1", [HALO, "SpanOverflowBoundGrid", "HierarchicalLooseGrid", "UniformGrid", "TwoLayerGrid", "SortAndSweep", "SpatialJoinSweep/sorted-btree"], (0,), ROUNDS))
+    # A world 16 times taller than wide, at the same density and finest cell
+    # width; `tall4` left the matrix on 2026-11-11.
+    cells.append(("tall16", "pairs", "1", [HALO, "SpanOverflowBoundGrid", "HierarchicalLooseGrid", "UniformGrid", "TwoLayerGrid", "SortAndSweep", "SpatialJoinSweep/sorted-btree"], (0,), ROUNDS))
     return cells
 
 
@@ -157,19 +163,42 @@ def output(*command):
     return subprocess.run(command, check=True, capture_output=True, text=True, errors="replace", cwd=REPO).stdout.strip()
 
 
+def powershell(command):
+    """The output of a PowerShell command, empty if it fails."""
+    try:
+        return output("powershell", "-NoProfile", "-Command", command)
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
 def machine():
-    """What the numbers depend on, beyond the sources."""
+    """What the numbers depend on, beyond the sources. Each value is read on its
+    own and is None where it cannot be: the CIM queries once printed nothing,
+    which shifted the lines of a combined query (baseline-2026-11-11-rerun
+    recorded the power scheme as its CPU)."""
     info = {"platform": platform.platform(), "logical_cpus": os.cpu_count()}
     if sys.platform == "win32":
-        query = ("(Get-CimInstance Win32_Processor).Name; "
-                 "(Get-CimInstance Win32_Battery).BatteryStatus; "
-                 "powercfg /getactivescheme")
-        lines = output("powershell", "-NoProfile", "-Command", query).splitlines()
-        info["cpu"] = lines[0].strip()
+        import ctypes
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+                info["cpu"] = winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
+        except OSError:
+            info["cpu"] = None
+
+        class PowerStatus(ctypes.Structure):
+            _fields_ = [("ac_line", ctypes.c_ubyte), ("battery_flag", ctypes.c_ubyte), ("battery_percent", ctypes.c_ubyte),
+                        ("saver", ctypes.c_ubyte), ("life_time", ctypes.c_ulong), ("full_life_time", ctypes.c_ulong)]
+
+        status = PowerStatus()
+        # ACLineStatus is 1 on AC power, 0 on battery and 255 if unknown.
+        known = ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status))
+        info["ac_power"] = {0: False, 1: True}.get(status.ac_line) if known else None
+        battery = powershell("(Get-CimInstance Win32_Battery).BatteryStatus").splitlines()
         # 2 is on AC power.
-        info["battery_status"] = lines[1].strip() if len(lines) > 2 else None
+        info["battery_status"] = battery[0].strip() if battery else None
         # The GUID alone: the rest is in the language of the system.
-        scheme = re.search(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", lines[-1])
+        scheme = re.search(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", powershell("powercfg /getactivescheme"))
         info["power_scheme"] = scheme.group(0) if scheme else None
     elif Path("/proc/cpuinfo").exists():
         text = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")

@@ -17,9 +17,16 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 RESULTS = REPO / "bench-results"
-# The groups of benches/search.rs and benches/update.rs.
-GROUPS = {"small_balls", "aligned", "gap", "adjacent", "moving", "self_query", "pairs", "small_pairs", "pairs_160k",
-          "search_160k", "update", "reinsert", "update_compare", "small_update", "update_160k"}
+# The groups of benches/search.rs and benches/update.rs by the sizes of their
+# items, listed apart; `search` stands for the ungrouped ids of the search bench.
+# `small_pairs` left the benches on 2026-11-11 and stays for the older runs.
+SECTIONS = (
+    ("mixed sizes", {"search", "moving", "self_query", "pairs", "pairs_160k", "search_160k", "update", "reinsert",
+                     "update_compare", "update_160k"}),
+    ("small items", {"small_balls", "small_pairs", "small_update"}),
+    ("other static scenes", {"aligned", "gap", "adjacent"}),
+)
+GROUPS = set().union(*(groups for _, groups in SECTIONS)) - {"search"}
 
 
 def minutes(seconds):
@@ -33,7 +40,8 @@ def describe(name, meta):
     version = {line.split(': ')[0]: line.split(': ')[1] for line in meta['rustc'] if ': ' in line}
     print(f"- {meta['rustc'][0]}, LLVM {version.get('LLVM version')}, {version.get('host')}; RUSTFLAGS `{meta['rustflags']}`.")
     machine = meta["machine"]
-    print(f"- {machine.get('cpu')}, core {meta['core']}, high priority; battery status {machine.get('battery_status')} (2 is on AC power); power scheme {machine.get('power_scheme')}.")
+    power = f"on AC power {machine['ac_power']}; " if "ac_power" in machine else ""
+    print(f"- {machine.get('cpu')}, core {meta['core']}, high priority; {power}battery status {machine.get('battery_status')} (2 is on AC power); power scheme {machine.get('power_scheme')}.")
     for number, attempt in enumerate(meta["attempts"], 1):
         parts = [f"build {minutes(attempt['build_s'])}"] if "build_s" in attempt else []
         previous = attempt.get("build_s", 0)
@@ -73,12 +81,18 @@ def criterion_tables(path):
         group = full_id.split("/", 1)[0]
         # The ungrouped ids of `search` are named after their structure.
         groups[(bench_of[full_id], group if group in GROUPS else "search")].append(full_id)
-    ordered = sorted(groups.items())
+    section_of = {group: number for number, (_, members) in enumerate(SECTIONS) for group in members}
+    ordered = sorted(groups.items(), key=lambda item: (section_of.get(item[0][1], len(SECTIONS)), item[0]))
     differences = []
     print("\n## Criterion\n")
     print("Median per iteration, µs, of the first round, with its 95% interval; the last column is the second round over the first.\n")
+    section = None
     for (bench, group), ids in ordered:
-        print(f"### {bench}: {group}\n")
+        number = section_of.get(group, len(SECTIONS))
+        if number != section:
+            section = number
+            print(f"### {SECTIONS[number][0].capitalize() if number < len(SECTIONS) else 'Other'}\n")
+        print(f"#### {bench}: {group}\n")
         print("| id | median | interval | round 2 / 1 |")
         print("|---|---:|---:|---:|")
         for full_id in sorted(ids):
@@ -109,7 +123,6 @@ def main():
         rows = [json.loads(line) for line in frame.read_text(encoding="utf-8").splitlines() if line.strip()]
         describe_load(rows, meta["machine"]["logical_cpus"])
         print(f"- {len(rows)} frame runs, {statistics.fmean(row['wall_s'] for row in rows):.1f} s on average.")
-        print("\n## Frames")
         sys.stdout.flush()
         subprocess.run([sys.executable, str(REPO / "benches" / "summarize_frames.py"), str(frame)], check=True)
     tsv = RESULTS / f"{name}.criterion.tsv"

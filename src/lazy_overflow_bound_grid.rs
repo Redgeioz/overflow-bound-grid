@@ -442,8 +442,8 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
     /// bounds intersect, with the two items in either order. On its own level
     /// an item reads only the items after it in its own node and the nodes
     /// after its own in row-major order, that is the neighbor to the right
-    /// and those in the row below, where a search with its bounds would read
-    /// them; items in the root pair up with the root items after them. Below
+    /// and those in the row below, each only if its box reaches the item;
+    /// items in the root pair up with the root items after them. Below
     /// its level an item scans the finer levels as a search does, so a pair
     /// across levels is found once, by the item on the coarser level, and no
     /// item looks above its own level. The nodes are visited depth first
@@ -478,28 +478,100 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
             finest,
             |level| (layers[level].cols(), layers[level].rows()),
             |level, x, y| {
-                for (index, entry) in layers[level][y][x].items.iter().enumerate() {
-                    if SELF_QUERY && entry.bounds.intersects(&entry.bounds) {
-                        callback(entry.item, entry.item);
-                    }
-                    let mut report = |found| {
-                        callback(entry.item, found);
-                        if SELF_QUERY {
-                            callback(found, entry.item);
-                        }
-                    };
-                    if level == 1 {
-                        self.get_root()
-                            .pair_with_after(index, &entry.bounds, &mut report);
-                    } else {
-                        self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
-                    }
-                    if level < finest {
-                        self.pair_scan_down(level, &entry.bounds, &mut report);
-                    }
+                if !layers[level][y][x].items.is_empty() {
+                    self.pair_node::<SELF_QUERY>(level, (x, y), finest, &mut callback);
                 }
             },
         );
+    }
+
+    /// The pair walk at node `(x, y)` of `level`, which holds items: each
+    /// item with the items after it in the node, with those of the four
+    /// neighbors after the node in row-major order whose boxes reach it, and,
+    /// on a level coarser than `finest`, with the items of the finer levels
+    /// by its scan.
+    ///
+    /// The four neighbors are judged by their own boxes as they are now, read
+    /// once for the node, as in
+    /// [`HaloOverflowBoundGrid`](crate::HaloOverflowBoundGrid): a box covers
+    /// its items at all times, so the tests hold before a refresh as well.
+    /// Judging each item by the bound of the level instead, as the ancestor
+    /// walk of a search does, with each box left to the read of its node,
+    /// the pair query took 1.39 to 1.41 times as long for 10,000 balls, 1.34
+    /// to 1.37 times for 160,000, and 1.11 to 1.13 times with 500 to 2,000
+    /// balls on 9 levels, on a Core Ultra 9 275HX with rustc 1.99
+    /// (`bench-results/r1-port-2026-11-10.md`).
+    ///
+    /// Not inlined: inlined into the walk it measured within 1% on the
+    /// scenes of 10,000 and 160,000 balls, but with 500 to 2,000 balls on 9
+    /// levels, where nearly every node the walk visits holds no items, it
+    /// took 1.3 to 1.5 times as long.
+    #[inline(never)]
+    fn pair_node<const SELF_QUERY: bool>(
+        &self,
+        level: usize,
+        (x, y): (usize, usize),
+        finest: usize,
+        callback: &mut impl FnMut(T, T),
+    ) {
+        let grid = &self.layers[level];
+        let node = &grid[y][x];
+        let (has_left, has_right) = (x > 0, x + 1 < grid.cols());
+        let has_below = y + 1 < grid.rows();
+        // SAFETY: `(x, y)` is a node of `grid`, and a neighbor is read only
+        // if the grid has it.
+        let (right, below_left, below, below_right) = unsafe {
+            (
+                box_at(grid, has_right, x + 1, y),
+                box_at(grid, has_left & has_below, x.wrapping_sub(1), y + 1),
+                box_at(grid, has_below, x, y + 1),
+                box_at(grid, has_right & has_below, x + 1, y + 1),
+            )
+        };
+        // The sides that face the node: how far each neighbor's items reach
+        // towards it.
+        let (right, below) = (right.min_x, below.min_y);
+        let below_left = [below_left.max_x, below_left.min_y];
+        let below_right = [below_right.min_x, below_right.min_y];
+        for (index, entry) in node.items.iter().enumerate() {
+            let bounds = &entry.bounds;
+            if SELF_QUERY && bounds.intersects(bounds) {
+                callback(entry.item, entry.item);
+            }
+            let mut report = |found| {
+                callback(entry.item, found);
+                if SELF_QUERY {
+                    callback(found, entry.item);
+                }
+            };
+            // All four are computed before the first neighbor is read.
+            let after = bounds.max_x > right;
+            let down = bounds.max_y > below;
+            let down_before = (bounds.min_x < below_left[0]) & (bounds.max_y > below_left[1]);
+            let down_after = (bounds.max_x > below_right[0]) & (bounds.max_y > below_right[1]);
+            node.pair_with_after(index, bounds, &mut report);
+            // SAFETY: the box of a missing neighbor is `EMPTY`, which fails
+            // every comparison above, so each node read here exists.
+            unsafe {
+                if after {
+                    grid.get_unchecked(y, x + 1).pair_with(bounds, &mut report);
+                }
+                if down_before {
+                    grid.get_unchecked(y + 1, x - 1)
+                        .pair_with(bounds, &mut report);
+                }
+                if down {
+                    grid.get_unchecked(y + 1, x).pair_with(bounds, &mut report);
+                }
+                if down_after {
+                    grid.get_unchecked(y + 1, x + 1)
+                        .pair_with(bounds, &mut report);
+                }
+            }
+            if level < finest {
+                self.pair_scan_down(level, bounds, &mut report);
+            }
+        }
     }
 
     /// Search from the bottom up, calling `callback` for each item found.
@@ -594,53 +666,6 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
         }
 
         self.search_up_3x3(level, bounds, &mut callback);
-    }
-
-    /// Search the half stencil of [`for_each_pair`] on level `level`: node
-    /// `(x, y)` after its item `start`, and of the neighbors after it in
-    /// row-major order those that the ancestor walk of a search with
-    /// `bounds` would read, by the same tests.
-    ///
-    /// [`for_each_pair`]: Self::for_each_pair
-    fn pair_half_stencil(
-        &self,
-        level: usize,
-        (x, y): (usize, usize),
-        start: usize,
-        bounds: &Rectangle,
-        callback: &mut impl FnMut(T),
-    ) {
-        let grid = &self.layers[level];
-        let geometry = &self.geometry[level];
-        let (offset_x, offset_y) = self.root_bounds.get_min();
-        let half_width = geometry.node_width * 0.5;
-        let half_height = geometry.node_height * 0.5;
-        let center_x = offset_x + geometry.node_width * (x as f64 + 0.5);
-        let center_y = offset_y + geometry.node_height * (y as f64 + 0.5);
-        let [left, right, top, _] = self.reach[level].shrink;
-        let left_column_reach = center_x - right * half_width;
-        let right_column_reach = center_x + left * half_width;
-        let bottom_row_reach = center_y + top * half_height;
-        let to_right = bounds.max_x >= right_column_reach && x + 1 != grid.cols();
-        let to_left = bounds.min_x <= left_column_reach && x != 0;
-        // SAFETY: `(x, y)` is a node of `grid`, and each neighbor is read only
-        // after testing that it exists.
-        unsafe {
-            grid.get_unchecked(y, x)
-                .pair_with_after(start, bounds, callback);
-            if to_right {
-                grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
-            }
-            if bounds.max_y >= bottom_row_reach && y + 1 != grid.rows() {
-                if to_left {
-                    grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
-                }
-                grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
-                if to_right {
-                    grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
-                }
-            }
-        }
     }
 
     /// Scan the levels finer than `level` over `bounds` for
@@ -830,6 +855,25 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
             });
 
         self.get_root().search_items(bounds, callback);
+    }
+}
+
+/// Box of node `(x, y)` of `grid` if `present`, else [`EMPTY`].
+///
+/// # Safety
+///
+/// `(x, y)` must be a node of `grid` when `present`.
+#[inline(always)]
+unsafe fn box_at<T: Copy>(
+    grid: &Grid<LazyOverflowBoundGridNode<T>>,
+    present: bool,
+    x: usize,
+    y: usize,
+) -> &Rectangle {
+    if present {
+        unsafe { &grid.get_unchecked(y, x).bounds }
+    } else {
+        &EMPTY
     }
 }
 

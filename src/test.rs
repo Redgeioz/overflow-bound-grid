@@ -459,6 +459,70 @@ rejects_max_level!(
     halo_grid_rejects_level_65: HaloOverflowBoundGrid::<usize, 65>::new(world()), "too large";
 );
 
+/// A world whose width or height is zero, negative, NaN or infinite is
+/// rejected by every hierarchical grid, square or fitted, with a message of
+/// its own. Trimmed to a world without height, every level ended up without
+/// rows, which the walks and scans, reading unchecked, do not expect: a search
+/// then panicked on an arithmetic overflow in debug builds and read out of
+/// bounds in release.
+#[test]
+fn hierarchical_grids_reject_worlds_without_extent() {
+    const WORLDS: [(&str, Rectangle); 7] = [
+        ("no height", Rectangle::new(0.0, 0.0, 100.0, 0.0)),
+        ("no width", Rectangle::new(5.0, -1.0, 5.0, 99.0)),
+        ("neither", Rectangle::new(3.0, 4.0, 3.0, 4.0)),
+        ("inverted", Rectangle::new(0.0, 100.0, 100.0, 0.0)),
+        ("a NaN corner", Rectangle::new(0.0, f64::NAN, 100.0, 100.0)),
+        (
+            "an infinite corner",
+            Rectangle::new(0.0, 0.0, f64::INFINITY, 100.0),
+        ),
+        (
+            "a width beyond the floats",
+            Rectangle::new(-1e308, 0.0, 1e308, 100.0),
+        ),
+    ];
+    macro_rules! rejects {
+        ($($tree:ident),*) => {$(
+            for (case, world) in &WORLDS {
+                for fit in [false, true] {
+                    let context = format!("{}, {case}, fit {fit}", stringify!($tree));
+                    assert_panics_with(&context, "positive, finite", || {
+                        if fit {
+                            $tree::<usize, MAX_LEVEL>::new_fit(world.clone());
+                        } else {
+                            $tree::<usize, MAX_LEVEL>::new(world.clone());
+                        }
+                    });
+                }
+            }
+        )*};
+    }
+    rejects!(
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
+        LazyOverflowBoundGrid,
+        SpanOverflowBoundGrid,
+        HaloOverflowBoundGrid,
+        HierarchicalLooseGrid
+    );
+}
+
+/// Runs `create`, which must panic with a message containing `expected`.
+fn assert_panics_with(
+    context: &str,
+    expected: &str,
+    create: impl FnOnce() + std::panic::UnwindSafe,
+) {
+    let panic = std::panic::catch_unwind(create).expect_err(context);
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or_default();
+    assert!(message.contains(expected), "{context}: {message}");
+}
+
 /// Structures whose search narrows the fixed reach of each level to a bound on
 /// how far that level's items extend beyond their cells, or skips cells by the
 /// bounding box of their items.
@@ -2248,6 +2312,325 @@ fn self_queries_match_brute_force() {
     check_self_query::<MultiGrid<usize>>("MultiGrid");
     check_self_query::<SpanGrid<usize>>("SpanGrid");
     check_self_query::<HaloGrid<usize>>("HaloGrid");
+}
+
+/// Worlds so much longer along one side that the rows or columns the other
+/// spans, a quotient of the two, underflow to zero: one far wider than high
+/// and one far higher than wide.
+const THIN_WORLDS: [Rectangle; 2] = [
+    Rectangle::new(0.0, 0.0, 1e200, 1e-200),
+    Rectangle::new(-3e-200, 5e199, -2e-200, 1.5e200),
+];
+
+/// Searches, pairs and self queries of a tree over `world` match brute force,
+/// stale and refreshed, on the `fixed` items and 300 random ones, as inserted
+/// and after two rounds of updates.
+fn check_world<Tree: OverflowBounded + PairQuery + SelfQuery>(
+    context: &str,
+    world: &Rectangle,
+    fit: bool,
+    fixed: &[Rectangle],
+    rng: &mut StdRng,
+) {
+    let context = format!("{context}, world {world:?}, fit {fit}");
+    let mut tree = Tree::create(world.clone(), fit);
+    let root = tree.root();
+    let mut bounds = fixed.to_vec();
+    bounds.extend((0..300).map(|_| tight_item(rng, &root, world, 0.1)));
+    let mut items: Vec<Option<(ItemHandle, Rectangle)>> = bounds
+        .into_iter()
+        .enumerate()
+        .map(|(id, bounds)| Some((tree.insert_item(bounds.clone(), id), bounds)))
+        .collect();
+    for round in 0..3 {
+        if round > 0 {
+            for (handle, bounds) in items.iter_mut().skip(fixed.len()).flatten() {
+                if rng.gen_bool(0.5) {
+                    *bounds = tight_item(rng, &root, world, 0.1);
+                    tree.update_item(bounds.clone(), *handle);
+                }
+            }
+        }
+        for state in ["stale", "refreshed"] {
+            let context = format!("{context}, round {round}, {state}");
+            if state == "refreshed" {
+                tree.refresh();
+            }
+            assert_tight_search_matches_brute_force(&tree, &items, rng, 100, &context);
+            assert_pairs_match_brute_force(&tree, &items, &context);
+            assert_self_query_matches_brute_force(&tree, &items, &context);
+        }
+    }
+}
+
+/// Over a thin world the levels trimmed to it keep one row or column, as the
+/// tests of `layer_geometry` check on their shapes; here the queries match
+/// brute force on such grids, whose pair walk has no row below a node, or no
+/// column beside it, on any level. The fitted grids of these worlds, whose
+/// levels stay square, and the single-level grids go along.
+fn check_thin_worlds<Tree: OverflowBounded + PairQuery + SelfQuery>(name: &str) {
+    let mut rng = StdRng::seed_from_u64(23);
+    for world in THIN_WORLDS {
+        for fit in [false, true] {
+            check_world::<Tree>(name, &world, fit, &[], &mut rng);
+        }
+    }
+}
+
+#[test]
+fn thin_worlds_keep_a_row_or_column() {
+    check_thin_worlds::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>("ExactOverflowBoundGrid");
+    check_thin_worlds::<BoxedLooseGrid<usize, MAX_LEVEL>>("BoxedLooseGrid");
+    check_thin_worlds::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>("LazyOverflowBoundGrid");
+    check_thin_worlds::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>("SpanOverflowBoundGrid");
+    check_thin_worlds::<HaloOverflowBoundGrid<usize, MAX_LEVEL>>("HaloOverflowBoundGrid");
+    check_thin_worlds::<HierarchicalLooseGrid<usize, MAX_LEVEL>>("HierarchicalLooseGrid");
+    check_thin_worlds::<SpanGrid<usize>>("SpanGrid");
+    check_thin_worlds::<HaloGrid<usize>>("HaloGrid");
+}
+
+/// Worlds twice as long as wide next to the largest floats, `2^1023` by
+/// `2^1022`: the rows or columns of the third level and finer, their nodes
+/// per axis times the shorter side over the longer one, overflow on the way
+/// to the quotient, which used to end the construction in an arithmetic
+/// overflow. The levels must still nest: next to the random items, an item of
+/// the second level and two equal ones of the third, centered on the world's
+/// edge along its longer side, are found by a search that walks up from the
+/// third level and by the pair walk, which comes to a node through its parent.
+fn check_huge_worlds<Tree: OverflowBounded + PairQuery + SelfQuery>(name: &str) {
+    let mut rng = StdRng::seed_from_u64(29);
+    let side = 2f64.powi(1022);
+    for wide in [true, false] {
+        // A square at these shares of `side` along the longer side and across.
+        let place = |along: f64, across: f64, size: f64| {
+            let (x, y) = if wide {
+                (along, across)
+            } else {
+                (across, along)
+            };
+            Rectangle::center_rect(x * side, y * side, size * side, size * side)
+        };
+        let world = if wide {
+            Rectangle::new(0.0, 0.0, 2.0 * side, side)
+        } else {
+            Rectangle::new(0.0, 0.0, side, 2.0 * side)
+        };
+        let fixed = [
+            place(1.0, 0.5, 0.75),
+            place(0.5, 1.0, 0.375),
+            place(0.5, 1.0, 0.375),
+        ];
+        assert!(fixed[0].intersects(&fixed[1]));
+        for fit in [false, true] {
+            check_world::<Tree>(name, &world, fit, &fixed, &mut rng);
+        }
+    }
+}
+
+#[test]
+fn levels_nest_in_worlds_next_to_the_largest_floats() {
+    check_huge_worlds::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>("ExactOverflowBoundGrid");
+    check_huge_worlds::<BoxedLooseGrid<usize, MAX_LEVEL>>("BoxedLooseGrid");
+    check_huge_worlds::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>("LazyOverflowBoundGrid");
+    check_huge_worlds::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>("SpanOverflowBoundGrid");
+    check_huge_worlds::<HaloOverflowBoundGrid<usize, MAX_LEVEL>>("HaloOverflowBoundGrid");
+    check_huge_worlds::<HierarchicalLooseGrid<usize, MAX_LEVEL>>("HierarchicalLooseGrid");
+}
+
+/// The side of the smallest root whose finest nodes are normal floats.
+const SMALLEST_SIDE: f64 = f64::MIN_POSITIVE * (1u32 << (MAX_LEVEL - 1)) as f64;
+
+/// Nodes below the normal floats gave wrong results: with an infinite
+/// reciprocal, or an infinite double of it, positions and scans collapsed onto
+/// the first and last nodes. The side one float below the smallest still
+/// rounds to the smallest normal node, so the first case is two floats below.
+#[test]
+fn grids_reject_nodes_below_the_normal_floats() {
+    const SIDES: [(&str, f64); 3] = [
+        ("just below", SMALLEST_SIDE.next_down().next_down()),
+        ("an infinite double of the reciprocal", 5.12e-307),
+        ("an infinite reciprocal", 2e-310),
+    ];
+    const CELLS: [(&str, Rectangle, f64); 3] = [
+        (
+            "just below",
+            Rectangle::new(
+                0.0,
+                0.0,
+                16.0 * f64::MIN_POSITIVE.next_down(),
+                16.0 * f64::MIN_POSITIVE.next_down(),
+            ),
+            f64::MIN_POSITIVE.next_down(),
+        ),
+        (
+            "an infinite reciprocal",
+            Rectangle::new(0.0, 0.0, 5e-311, 5e-311),
+            3.125e-312,
+        ),
+        (
+            "a root too far from the origin to keep any size",
+            Rectangle::new(1e20, 1e20, 1e20 + 16.0, 1e20 + 16.0),
+            1.0,
+        ),
+    ];
+    macro_rules! hierarchical {
+        ($($tree:ident),*) => {$(
+            for (case, side) in SIDES {
+                let world = Rectangle::new(0.0, 0.0, side, side);
+                for fit in [false, true] {
+                    let context = format!("{}, {case}, fit {fit}", stringify!($tree));
+                    assert_panics_with(&context, "normal size", || {
+                        if fit {
+                            $tree::<usize, MAX_LEVEL>::new_fit(world.clone());
+                        } else {
+                            $tree::<usize, MAX_LEVEL>::new(world.clone());
+                        }
+                    });
+                }
+            }
+            // A fitted level keeps both sides of the world; a square root
+            // takes the size of the longer one.
+            for (width, height) in [(1.0, 1e-310), (1e-310, 1.0)] {
+                let world = Rectangle::new(0.0, 0.0, width, height);
+                assert_panics_with(stringify!($tree), "normal size", || {
+                    $tree::<usize, MAX_LEVEL>::new_fit(world.clone());
+                });
+                $tree::<usize, MAX_LEVEL>::new(world);
+            }
+            let smallest = Rectangle::new(0.0, 0.0, SMALLEST_SIDE, SMALLEST_SIDE);
+            $tree::<usize, MAX_LEVEL>::new(smallest.clone());
+            $tree::<usize, MAX_LEVEL>::new_fit(smallest);
+        )*};
+    }
+    hierarchical!(
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
+        LazyOverflowBoundGrid,
+        SpanOverflowBoundGrid,
+        HaloOverflowBoundGrid,
+        HierarchicalLooseGrid
+    );
+    macro_rules! single_level {
+        ($($tree:ident),*) => {$(
+            for (case, world, cell_size) in CELLS {
+                let context = format!("{}, {case}", stringify!($tree));
+                assert_panics_with(&context, "normal size", || {
+                    $tree::<usize>::new(world.clone(), cell_size);
+                });
+            }
+            let side = 16.0 * f64::MIN_POSITIVE;
+            $tree::<usize>::new(Rectangle::new(0.0, 0.0, side, side), f64::MIN_POSITIVE);
+        )*};
+    }
+    single_level!(SpanGrid, HaloGrid);
+}
+
+/// Over the smallest world that the grids accept, whose finest nodes are the
+/// smallest normal floats, the queries match brute force, also on two items
+/// that meet with one centered on the world's origin, the case that was lost
+/// to the first node when the reciprocal came out infinite.
+fn check_smallest_worlds<Tree: OverflowBounded + PairQuery + SelfQuery>(name: &str) {
+    let mut rng = StdRng::seed_from_u64(31);
+    let world = Rectangle::new(0.0, 0.0, SMALLEST_SIDE, SMALLEST_SIDE);
+    let size = SMALLEST_SIDE / 128.0;
+    let fixed = [
+        Rectangle::center_rect(0.0, 0.0, size, size),
+        Rectangle::center_rect(0.4 * size, 0.4 * size, size, size),
+    ];
+    assert!(fixed[0].intersects(&fixed[1]));
+    for fit in [false, true] {
+        check_world::<Tree>(name, &world, fit, &fixed, &mut rng);
+    }
+}
+
+#[test]
+fn queries_stay_exact_over_the_smallest_worlds() {
+    check_smallest_worlds::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>("ExactOverflowBoundGrid");
+    check_smallest_worlds::<BoxedLooseGrid<usize, MAX_LEVEL>>("BoxedLooseGrid");
+    check_smallest_worlds::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>("LazyOverflowBoundGrid");
+    check_smallest_worlds::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>("SpanOverflowBoundGrid");
+    check_smallest_worlds::<HaloOverflowBoundGrid<usize, MAX_LEVEL>>("HaloOverflowBoundGrid");
+    check_smallest_worlds::<HierarchicalLooseGrid<usize, MAX_LEVEL>>("HierarchicalLooseGrid");
+    check_smallest_worlds::<SpanGrid<usize>>("SpanGrid");
+    check_smallest_worlds::<HaloGrid<usize>>("HaloGrid");
+}
+
+/// A tree refreshed for pairs, every second time twice in a row, and fully at
+/// every `FULL`th refresh unless `FULL` is zero: orders a caller may mix, so
+/// every query must stay exact through them, searches included.
+struct ForPairs<Tree, const FULL: u32> {
+    tree: Tree,
+    refreshes: u32,
+}
+
+macro_rules! for_pairs {
+    ($($tree:ty),*) => {$(
+        impl<const FULL: u32> OverflowBounded for ForPairs<$tree, FULL> {
+            fn create(world: Rectangle, fit: bool) -> Self {
+                Self {
+                    tree: <$tree as OverflowBounded>::create(world, fit),
+                    refreshes: 0,
+                }
+            }
+            fn root(&self) -> Rectangle {
+                self.tree.root()
+            }
+            fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+                self.tree.insert_item(bounds, id)
+            }
+            fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+                self.tree.update_item(bounds, handle);
+            }
+            fn remove_item(&mut self, handle: ItemHandle) {
+                self.tree.remove_item(handle);
+            }
+            fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+                self.tree.search_items(bounds, callback);
+            }
+            fn refresh(&mut self) {
+                self.refreshes += 1;
+                if FULL != 0 && self.refreshes % FULL == 0 {
+                    self.tree.refresh_bounds();
+                } else {
+                    self.tree.refresh_for_pairs();
+                    if self.refreshes % 2 == 0 {
+                        self.tree.refresh_for_pairs();
+                    }
+                }
+            }
+        }
+
+        impl<const FULL: u32> PairQuery for ForPairs<$tree, FULL> {
+            fn pairs(&self, callback: &mut dyn FnMut(usize, usize)) {
+                self.tree.pairs(callback);
+            }
+        }
+
+        impl<const FULL: u32> SelfQuery for ForPairs<$tree, FULL> {
+            fn self_query(&self, callback: &mut dyn FnMut(usize, usize)) {
+                self.tree.self_query(callback);
+            }
+        }
+    )*};
+}
+for_pairs!(HaloOverflowBoundGrid<usize, MAX_LEVEL>, HaloGrid<usize>);
+
+/// Refreshing for pairs leaves the copies behind the boxes, which the searches
+/// must notice: with only such refreshes, and with a full one among them.
+#[test]
+fn refreshes_for_pairs_keep_every_query_exact() {
+    macro_rules! check {
+        ($($tree:ty),*) => {$(
+            let name = stringify!($tree);
+            check_tight_bounds::<ForPairs<$tree, 0>>(&format!("{name}, only for pairs"));
+            check_tight_bounds::<ForPairs<$tree, 3>>(&format!("{name}, full every third"));
+            check_pairs::<ForPairs<$tree, 0>>(&format!("{name}, only for pairs"));
+            check_pairs::<ForPairs<$tree, 3>>(&format!("{name}, full every third"));
+            check_self_query::<ForPairs<$tree, 0>>(&format!("{name}, only for pairs"));
+            check_self_query::<ForPairs<$tree, 3>>(&format!("{name}, full every third"));
+        )*};
+    }
+    check!(HaloOverflowBoundGrid<usize, MAX_LEVEL>, HaloGrid<usize>);
 }
 
 /// Fitted worlds wider and taller than high, whose roots differ between the

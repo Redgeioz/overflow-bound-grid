@@ -22,7 +22,7 @@ shift $(($# < 2 ? $# : 2))
 seeds=("$@")
 [ ${#seeds[@]} -gt 0 ] || seeds=(0 1)
 
-read -r -a structures <<< "${STRUCTURES:-HaloOverflowBoundGrid SpanOverflowBoundGrid HierarchicalLooseGrid UniformGrid TwoLayerGrid SortAndSweep ParryBvh/rebuild-binned ParryBvh/rebuild-ploc ParryBvh/refit ParryBvh/refit-opt ParryBvh/refit-opt-m5 ParryBvh/refit-opt-m25 ParryBvh/reinsert-m25}"
+read -r -a structures <<< "${STRUCTURES:-HaloOverflowBoundGrid SpanOverflowBoundGrid HierarchicalLooseGrid BoxedLooseGrid UniformGrid TwoLayerGrid SortAndSweep ParryBvh/rebuild-binned ParryBvh/rebuild-ploc ParryBvh/refit ParryBvh/refit-opt ParryBvh/refit-opt-m5 ParryBvh/refit-opt-m25 ParryBvh/reinsert-m25}"
 read -r -a modes <<< "${MODES:-search pairs}"
 read -r -a scenes <<< "${SCENES:-10k 160k}"
 

@@ -476,7 +476,7 @@ fn bench_pairs_on<Tree: QTree<usize>>(
     for (id, bounds) in bounds.iter().enumerate() {
         tree.insert_item(bounds.clone(), id);
     }
-    tree.end_frame();
+    tree.end_frame_for_pairs();
     let mut count = 0usize;
     pairs(&tree, &mut |_, _| count += 1);
     eprintln!("{name}: {count} pairs");
@@ -609,26 +609,6 @@ fn search_160k(c: &mut Criterion) {
     group.finish();
 }
 
-/// The pairs of the small balls, which all fit a cell, in the single-level
-/// grids with cells of 156.25 units; `MultiGrid` with one collection is a
-/// single-level loose grid without bounds.
-fn small_pairs(c: &mut Criterion) {
-    let mut group = c.benchmark_group("small_pairs");
-    macro_rules! arm {
-        ($name:expr, $tree:expr) => {
-            bench_pairs(&mut group, $name, $tree, 0, |tree, callback| {
-                tree.for_each_pair(|a, b| callback(a, b))
-            })
-        };
-    }
-    arm!("MultiGrid/156", tree!(MultiGrid, &[HALF_CELL_SIZE]));
-    arm!("UniformGrid/156", tree!(UniformGrid, HALF_CELL_SIZE));
-    arm!("TwoLayerGrid/156", tree!(TwoLayerGrid, HALF_CELL_SIZE));
-    arm!("SpanGrid/156", tree!(SpanGrid, HALF_CELL_SIZE));
-    arm!("HaloGrid/156", tree!(HaloGrid, HALF_CELL_SIZE));
-    group.finish();
-}
-
 criterion_group!(
     name = bench;
     config = criterion_config();
@@ -640,7 +620,6 @@ criterion_group!(
     moving,
     self_query,
     pairs,
-    small_pairs,
     pairs_160k,
     search_160k,
 );
